@@ -24,7 +24,7 @@ A real-time edge detection and 3D line segment extraction system for Unity, feat
 
 | Edge Detection | 3D Line Segments |
 |:---:|:---:|
-| Sobel / Roberts / Prewitt | RANSAC Line Fitting |
+| ![Edge Detection](docs/edgedetection.png) | ![RANSAC Line Fitting](docs/ransaclinefitting.png) |
 
 ---
 
