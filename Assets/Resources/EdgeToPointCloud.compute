@@ -1,0 +1,34 @@
+#pragma kernel ExtractPoints
+
+Texture2D<float4> _EdgeTex;
+Texture2D<float4> _WorldPosTex;
+
+// DÜZELTME: RWStructuredBuffer yerine AppendStructuredBuffer kullandık.
+// Artık .Append() fonksiyonu hata vermez.
+AppendStructuredBuffer<float3> _PointBuffer;
+
+float _MinEdgeThreshold;
+int _Step;
+
+[numthreads(8, 8, 1)]
+void ExtractPoints(uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    _EdgeTex.GetDimensions(width, height);
+
+    if (id.x >= width || id.y >= height) return;
+    if (id.x % _Step != 0 || id.y % _Step != 0) return;
+
+    // Sadece parlaklık kontrolü
+    float edgeVal = _EdgeTex[id.xy].r;
+    
+    if (edgeVal > _MinEdgeThreshold)
+    {
+        float4 worldPos = _WorldPosTex[id.xy];
+        if (worldPos.w > 0) // Geçerli pozisyon mu?
+        {
+            // Listeye ekle
+            _PointBuffer.Append(worldPos.xyz);
+        }
+    }
+}
