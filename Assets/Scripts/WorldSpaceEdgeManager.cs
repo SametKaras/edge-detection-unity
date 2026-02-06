@@ -66,7 +66,7 @@ namespace SceneCapture.Edge3D
         
         private bool _isJobRunning = false;
         private bool _hasNewData = false;
-        private float _lastJobFinishTime = -999f; // İlk açılışta hemen çalışsın diye
+        private float _lastJobFinishTime = -999f;
         
         private Line3D[] _displayLines;
 
@@ -99,23 +99,20 @@ namespace SceneCapture.Edge3D
 
         void Update()
         {
-            // 1. İşlem Devam Ediyor mu?
             if (_isJobRunning)
             {
                 if (_ransacJobHandle.IsCompleted)
                 {
                     CompleteJob();
                 }
-                return; // İş bitmediyse bekle, yeni iş alma
+                return;
             }
 
-            // 2. Zamanlayıcı Kontrolü (Senin İstediğin Özellik)
             if (Time.time - _lastJobFinishTime < updateInterval)
             {
-                return; // Süre dolmadı, bekle
+                return;
             }
 
-            // 3. Yeni Veri İste
             if (worldPosShader == null || pointExtractorCS == null || _edgeEffect.EdgeResultTexture == null) return;
             RenderAndExtractPoints();
         }
@@ -139,7 +136,6 @@ namespace SceneCapture.Edge3D
             pointExtractorCS.SetTexture(kernel, "_WorldPosTex", _worldPosRT);
             pointExtractorCS.SetFloat("_MinEdgeThreshold", minEdgeLuminance);
             
-            // Kullanıcının girdiği Pixel Step değerini kullan
             pointExtractorCS.SetInt("_Step", pixelStep); 
             pointExtractorCS.SetBuffer(kernel, "_PointBuffer", _pointBuffer);
 
@@ -200,7 +196,7 @@ namespace SceneCapture.Edge3D
 
             _isJobRunning = false;
             
-            // Zamanlayıcıyı başlat (Bitiş zamanını kaydet)
+            // Zamanlayıcıyı başlat
             _lastJobFinishTime = Time.time; 
         }
 
@@ -266,10 +262,7 @@ namespace SceneCapture.Edge3D
             float thresholdSq = Threshold * Threshold;
             float segLengthSq = MaxSegLength * MaxSegLength;
 
-            // HİBRİT AYARLARI
-            // Array içinde ne kadar uzağa bakacağız? (Küp için ideal)
             int neighborSearchRange = 4000; 
-            // Ön elemede kaç noktaya bakacağız? (Hız için)
             int preCheckCount = 64; 
 
             while (linesFound < MaxLinesToFind && totalPointsUsed < pointCount - MinInliers)
@@ -284,21 +277,15 @@ namespace SceneCapture.Edge3D
                     if (usedPoints[idx1]) continue;
                     float3 p1 = InputPoints[idx1];
 
-                    // --- STRATEJİ DEĞİŞİKLİĞİ: HİBRİT ARAMA ---
-                    // Her 3 denemeden 1'ini "Global" (Tüm Sahne) yap.
-                    // Kalan 2'sini "Local" (Hızlı Komşu) yap.
-                    // Bu sayede Küre gibi dağınık verileri kaçırmayız ama hala çok hızlıyız.
                     bool useGlobalSearch = (iter % 3 == 0); 
 
                     int idx2;
                     if (useGlobalSearch)
                     {
-                        // ESKİ USÜL (Küre için şart)
                         idx2 = rng.NextInt(pointCount);
                     }
                     else
                     {
-                        // YENİ USÜL (Küp ve Hız için)
                         int minIdx = math.max(0, idx1 - neighborSearchRange);
                         int maxIdx = math.min(pointCount, idx1 + neighborSearchRange);
                         idx2 = rng.NextInt(minIdx, maxIdx);
@@ -312,13 +299,9 @@ namespace SceneCapture.Edge3D
                     float3 lineVec = math.normalize(p2 - p1);
                     float3 lineStart = p1;
 
-                    // --- ERKEN KAÇIŞ (Optimize Edildi) ---
-                    // Küre kavisli olduğu için düz çizgiye az nokta değer.
-                    // O yüzden ön eleme eşiğini (minHits) çok düşük tutuyoruz (1 bile yeter).
                     int preInliers = 0;
                     for(int k=0; k < preCheckCount; k++)
                     {
-                        // Test noktalarını da hibrit seçelim
                         int testIdx;
                         if(useGlobalSearch) 
                             testIdx = rng.NextInt(pointCount);
@@ -337,22 +320,15 @@ namespace SceneCapture.Edge3D
                                  if (math.lengthsq(math.cross(tp - lineStart, lineVec)) < thresholdSq)
                                  {
                                      preInliers++;
-                                     // Eğer 2 tane bile bulursan, bu çizgi umut vericidir. Devam et.
                                      if(preInliers >= 2) break; 
                                  }
                              }
                         }
                     }
 
-                    // Eğer ön elemede hiç destekçi yoksa atla (Büyük hız kazancı)
                     if (preInliers == 0 && pointCount > 2000) continue; 
-                    // ------------------------------------------
 
-                    // Tam tarama (Full Check)
                     int currentInliers = 0;
-                    // Tam taramayı hızlandırmak için sadece bounding box içindekilere bakabiliriz ama
-                    // array sırasız olduğu için mecburen döngü kuruyoruz.
-                    // Burst Compiler burayı vektörize edeceği için hızlıdır.
                     for (int i = 0; i < pointCount; i++)
                     {
                         if (usedPoints[i]) continue;
@@ -367,7 +343,6 @@ namespace SceneCapture.Edge3D
                         bestInlierCount = currentInliers;
                         bestP1 = p1; bestP2 = p2;
                         
-                        // Küre için çok yüksek inlier beklememek lazım, eşiği makul tutalım.
                         if (bestInlierCount > 100) break; 
                     }
                 }
@@ -412,4 +387,3 @@ namespace SceneCapture.Edge3D
         }
     }
 }
-
