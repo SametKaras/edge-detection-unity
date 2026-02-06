@@ -7,49 +7,48 @@ namespace SceneCapture.Hough
 {
     /// <summary>
     /// GPU'daki edge texture'ını CPU'ya asenkron aktarır.
-    /// GPU'da hesaplanan edge ve gradient verilerini ana thread'i bloklamadan CPU'ya taşır.
+    /// 
+    /// İYİLEŞTİRME:
+    ///   Gradient material'ına EdgeDetection.shader ile aynı kaynak parametrelerini geçirir.
+    ///   Böylece EdgeDirection.shader Combined/Depth/Normal modda doğru gradient hesaplar.
     /// </summary>
     public class EdgeFrameProcessor : IDisposable
     {
-        // CPU tarafında tutulan bufferlar - GPU'dan gelen veriler buraya kopyalanır
-        private NativeArray<byte> _edgeBuffer;           // Edge map: 0=edge yok, 255=edge var
-        private NativeArray<float> _gradientXBuffer;     // X yönünde gradient değerleri (-1 to +1)
-        private NativeArray<float> _gradientYBuffer;     // Y yönünde gradient değerleri (-1 to +1)
-        private NativeArray<float> _magnitudeBuffer;     // Gradient magnitude: sqrt(gx² + gy²)
-        private NativeArray<Vector2Int> _edgePixels;     // Edge olan pixellerin koordinat listesi
+        private NativeArray<byte> _edgeBuffer;
+        private NativeArray<float> _gradientXBuffer;
+        private NativeArray<float> _gradientYBuffer;
+        private NativeArray<float> _magnitudeBuffer;
+        private NativeArray<Vector2Int> _edgePixels;
         
-        // Texture boyutları ve state bilgileri
-        private int _width, _height;                     // Downsampled texture boyutları
-        private bool _readbackPending;                   // Async readback bekliyor mu?
-        private bool _dataReady;                         // Data kullanıma hazır mı?
-        private bool _disposed;                          // Dispose edildi mi?
-        private int _frameCounter;                       // Frame sayacı (updateInterval için)
-        private int _pendingReadbackCount;               // Kaç readback bekleniyor (edge + gradient = 2)
+        private int _width, _height;
+        private bool _readbackPending;
+        private bool _dataReady;
+        private bool _disposed;
+        private int _frameCounter;
+        private int _pendingReadbackCount;
         
-        // GPU resources
-        private RenderTexture _downsampledRT;            // Küçültülmüş edge texture
-        private RenderTexture _gradientRT;               // Gradient bilgisi içeren texture (float)
-        private Material _gradientMaterial;              // EdgeDirection shader için material
+        private RenderTexture _downsampledRT;
+        private RenderTexture _gradientRT;
+        private Material _gradientMaterial;
         
-        // Edge pixel limitleri
-        private const int MAX_EDGE_PIXELS = 100000;      // Maksimum edge pixel sayısı
-        private int _edgePixelCount;                     // Gerçekte bulunan edge pixel sayısı
+        private const int MAX_EDGE_PIXELS = 100000;
+        private int _edgePixelCount;
         
-        // Public propertyler - dışarıdan okunabilir
         public bool IsDataReady => _dataReady && !_disposed;
         public int Width => _width;
         public int Height => _height;
         public int EdgePixelCount => _edgePixelCount;
         
-        // Burst job'lar için NativeArray erişimi
         public NativeArray<float> GradientXBuffer => _gradientXBuffer;
         public NativeArray<float> GradientYBuffer => _gradientYBuffer;
         public NativeArray<float> MagnitudeBuffer => _magnitudeBuffer;
         public NativeArray<byte> EdgeBuffer => _edgeBuffer;
         
+        // İYİLEŞTİRME: Source keyword'leri
+        private static readonly string[] SourceKeywords = { "_SOURCE_LUMINANCE", "_SOURCE_DEPTH", "_SOURCE_NORMAL", "_SOURCE_COMBINED" };
+        
         public EdgeFrameProcessor()
         {
-            // EdgeDirection shader'ını bulup material oluştur
             var shader = Shader.Find("Custom/EdgeDirection");
             if (shader != null)
                 _gradientMaterial = new Material(shader);
@@ -57,57 +56,66 @@ namespace SceneCapture.Hough
         
         /// <summary>
         /// Her frame çağrılır, GPU'daki texture'ı işler ve async readback başlatır
+        /// 
+        /// İYİLEŞTİRME: edgeSource parametresi eklendi — gradient shader'a kaynak türünü iletir
         /// </summary>
-        public void ProcessFrame(RenderTexture sourceRT, float edgeThreshold, int downsample, int updateInterval)
+        public void ProcessFrame(RenderTexture sourceRT, float edgeThreshold, int downsample, int updateInterval,
+            int edgeSourceIndex = 0, float depthSensitivity = 10f, float maxDepth = 50f, float normalSensitivity = 1f,
+            float depthWeight = 0.5f, float normalWeight = 0.5f, float colorWeight = 0.3f)
         {
-            // Null check, disposed check ve pending check
             if (sourceRT == null || _disposed || _readbackPending) return;
             
-            // Frame sayacını artır
             _frameCounter++;
             
-            // updateInterval kontrolü: Her N frame'de bir işle
             if (_frameCounter % updateInterval != 0) return;
             
-            // Hedef resolution hesapla (downsampling ile küçültme)
             int targetWidth = sourceRT.width / downsample;
             int targetHeight = sourceRT.height / downsample;
             
-            // RenderTexture'ları ve NativeArray'leri hazırla
             EnsureResources(targetWidth, targetHeight);
             
-            // Source RT'yi downsampled RT'ye kopyala (GPU'da hızlı)
             Graphics.Blit(sourceRT, _downsampledRT);
             
-            // Gradient hesaplama shader'ını çalıştır
             if (_gradientMaterial != null)
             {
-                // Threshold parametresini shader'a gönder
                 _gradientMaterial.SetFloat("_EdgeThreshold", edgeThreshold * 0.5f);
                 
-                // Shader ile gradient texture oluştur (R=gx, G=gy, B=magnitude)
+                // İYİLEŞTİRME: Kaynak parametrelerini gradient shader'a geçir
+                // EdgeDetection.shader ile tutarlılık sağlanır
+                foreach (var kw in SourceKeywords) _gradientMaterial.DisableKeyword(kw);
+                int sourceIdx = Mathf.Clamp(edgeSourceIndex, 0, SourceKeywords.Length - 1);
+                _gradientMaterial.EnableKeyword(SourceKeywords[sourceIdx]);
+                
+                _gradientMaterial.SetFloat("_DepthSensitivity", depthSensitivity);
+                _gradientMaterial.SetFloat("_MaxDepth", maxDepth);
+                _gradientMaterial.SetFloat("_NormalSensitivity", normalSensitivity);
+                _gradientMaterial.SetFloat("_DepthWeight", depthWeight);
+                _gradientMaterial.SetFloat("_NormalWeight", normalWeight);
+                _gradientMaterial.SetFloat("_ColorWeight", colorWeight);
+                
                 Graphics.Blit(sourceRT, _gradientRT, _gradientMaterial);
             }
             
-            // Async GPU→CPU transfer başlat
             StartReadback(targetWidth, targetHeight, edgeThreshold);
         }
         
-        /// <summary>
-        /// RenderTexture'ları ve NativeArray bufferları hazırla/yeniden oluştur
-        /// </summary>
+        // ÖNCEKİ İMZAYI KORUYORUZ (geriye uyumluluk)
+        // Bu overload eskisi gibi çalışır — varsayılan Luminance modu
+        public void ProcessFrame(RenderTexture sourceRT, float edgeThreshold, int downsample, int updateInterval)
+        {
+            ProcessFrame(sourceRT, edgeThreshold, downsample, updateInterval, 0);
+        }
+        
         private void EnsureResources(int width, int height)
         {
-            // Downsampled RT kontrolü - yoksa veya boyut değişmişse yeniden oluştur
             if (_downsampledRT == null || _downsampledRT.width != width)
             {
                 if (_downsampledRT != null) _downsampledRT.Release();
                 _downsampledRT = new RenderTexture(width, height, 0, RenderTextureFormat.ARGB32);
-                _downsampledRT.filterMode = FilterMode.Point;  // Nearest neighbor filtering
+                _downsampledRT.filterMode = FilterMode.Point;
                 _downsampledRT.Create();
             }
             
-            // Gradient RT kontrolü - float precision gerekli
             if (_gradientRT == null || _gradientRT.width != width)
             {
                 if (_gradientRT != null) _gradientRT.Release();
@@ -116,82 +124,62 @@ namespace SceneCapture.Hough
                 _gradientRT.Create();
             }
             
-            // NativeArray bufferları kontrol et ve gerekirse yeniden oluştur
             int pixelCount = width * height;
             EnsureBuffer(ref _edgeBuffer, pixelCount);
             EnsureBuffer(ref _gradientXBuffer, pixelCount);
             EnsureBuffer(ref _gradientYBuffer, pixelCount);
             EnsureBuffer(ref _magnitudeBuffer, pixelCount);
             
-            // Edge pixel listesi - sadece bir kere oluştur
             if (!_edgePixels.IsCreated)
                 _edgePixels = new NativeArray<Vector2Int>(MAX_EDGE_PIXELS, Allocator.Persistent);
         }
         
-        /// <summary>
-        /// NativeArray buffer'ı kontrol et, yoksa/yanlış boyuttaysa oluştur
-        /// </summary>
         private void EnsureBuffer<T>(ref NativeArray<T> buffer, int size) where T : struct
         {
             if (!buffer.IsCreated || buffer.Length != size)
             {
-                if (buffer.IsCreated) buffer.Dispose();  // Eski buffer'ı temizle
+                if (buffer.IsCreated) buffer.Dispose();
                 buffer = new NativeArray<T>(size, Allocator.Persistent);
             }
         }
         
-        /// <summary>
-        /// İki ayrı async readback başlat: edge texture ve gradient texture
-        /// </summary>
         private void StartReadback(int width, int height, float threshold)
         {
             _width = width;
             _height = height;
-            _readbackPending = true;    // Readback bekliyor flag'i
-            _dataReady = false;         // Data henüz hazır değil
-            _pendingReadbackCount = 2;  // 2 readback bekliyoruz (edge + gradient)
+            _readbackPending = true;
+            _dataReady = false;
+            _pendingReadbackCount = 2;
             
-            // Readback 1: Edge texture (RGBA32 formatında)
             AsyncGPUReadback.Request(_downsampledRT, 0, TextureFormat.RGBA32, 
                 req => OnEdgeReadback(req, width, height, threshold));
             
-            // Readback 2: Gradient texture (RGBAFloat formatında)
             AsyncGPUReadback.Request(_gradientRT, 0, TextureFormat.RGBAFloat, 
                 req => OnGradientReadback(req, width, height));
         }
         
-        /// <summary>
-        /// Edge texture readback tamamlandığında çağrılır
-        /// </summary>
         private void OnEdgeReadback(AsyncGPUReadbackRequest request, int width, int height, float threshold)
         {
             try
             {
-                // Hata kontrolü
                 if (_disposed || !_edgeBuffer.IsCreated || request.hasError) 
                 { 
                     CompleteReadback(); 
                     return; 
                 }
                 
-                // GPU'dan gelen data'yı al
                 var data = request.GetData<Color32>();
                 int count = Mathf.Min(data.Length, _edgeBuffer.Length);
                 
-                // Sadece R kanalını kopyala (0 veya 255)
                 for (int i = 0; i < count; i++)
                     _edgeBuffer[i] = data[i].r;
                 
-                // Edge pixel listesi oluştur
                 CollectEdgePixels(width, height, threshold);
                 CompleteReadback();
             }
             catch { }
         }
         
-        /// <summary>
-        /// Gradient texture readback tamamlandığında çağrılır
-        /// </summary>
         private void OnGradientReadback(AsyncGPUReadbackRequest request, int width, int height)
         {
             try
@@ -202,11 +190,9 @@ namespace SceneCapture.Hough
                     return; 
                 }
                 
-                // GPU'dan gradient data'yı al
                 var data = request.GetData<Color>();
                 int count = Mathf.Min(data.Length, _gradientXBuffer.Length);
                 
-                // Her pixel için gradient decode et (0-1 → -1 to +1)
                 for (int i = 0; i < count; i++)
                 {
                     float gx = data[i].r * 2f - 1f;
@@ -220,9 +206,6 @@ namespace SceneCapture.Hough
             catch { }
         }
         
-        /// <summary>
-        /// Readback counter azalt, her ikisi de bitince data hazır
-        /// </summary>
         private void CompleteReadback()
         {
             _pendingReadbackCount--;
@@ -233,15 +216,11 @@ namespace SceneCapture.Hough
             }
         }
         
-        /// <summary>
-        /// Threshold'dan büyük pixelleri listele (Hough için)
-        /// </summary>
         private void CollectEdgePixels(int width, int height, float threshold)
         {
             _edgePixelCount = 0;
             byte thresholdByte = (byte)(threshold * 255f);
             
-            // Tüm pixelleri tara
             for (int y = 0; y < height && _edgePixelCount < MAX_EDGE_PIXELS; y++)
             {
                 for (int x = 0; x < width && _edgePixelCount < MAX_EDGE_PIXELS; x++)
@@ -273,22 +252,16 @@ namespace SceneCapture.Hough
             return _edgeBuffer[y * _width + x] > (byte)(threshold * 255f);
         }
         
-        /// <summary>
-        /// Screen koordinatı → Texture koordinatı (Y flip)
-        /// </summary>
         public Vector2Int ScreenToTextureCoords(Vector2 screenPos, int screenWidth, int screenHeight)
         {
             float nx = screenPos.x / screenWidth;
-            float ny = 1f - (screenPos.y / screenHeight);  // Y flip
+            float ny = 1f - (screenPos.y / screenHeight);
             return new Vector2Int(
                 Mathf.Clamp((int)(nx * _width), 0, _width - 1),
                 Mathf.Clamp((int)(ny * _height), 0, _height - 1)
             );
         }
         
-        /// <summary>
-        /// Texture koordinatı → Screen koordinatı (Y flip)
-        /// </summary>
         public Vector2 TextureToScreenCoords(Vector2 texCoords, int screenWidth, int screenHeight)
         {
             return new Vector2(
@@ -297,9 +270,6 @@ namespace SceneCapture.Hough
             );
         }
         
-        /// <summary>
-        /// Tüm resources temizle (memory leak önleme)
-        /// </summary>
         public void Dispose()
         {
             _disposed = true;
