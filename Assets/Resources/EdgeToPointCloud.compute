@@ -1,38 +1,150 @@
+// ============================================================
+// EdgeToPointCloud.compute
+// ============================================================
+//
+// AMAÇ:
+//   2D kenar (edge) piksellerini 3D nokta bulutuna (point cloud) dönüştürmek.
+//   Yani ekrandaki beyaz edge piksellerin gerçek dünya koordinatlarını bulmak.
+//
+// NASIL ÇALIŞIR:
+//   İki texture'ı birleştirir:
+//
+//   1. _EdgeTex (EdgeDetection.shader çıktısı):
+//      → Beyaz piksel = kenar var, siyah = kenar yok
+//      → Hangi piksellerin kenar olduğunu söyler
+//
+//   2. _WorldPosTex (WorldPosBuffer.shader çıktısı):
+//      → Her pikselin 3D dünya koordinatı (x, y, z)
+//      → Kenar piksellerinin 3D'de nerede olduğunu söyler
+//
+//   Mantık:
+//      EĞER piksel beyaz (edge) İSE
+//        → O pikselin dünya pozisyonunu _PointBuffer'a ekle
+//
+// ÇIKTI:
+//   AppendStructuredBuffer<float3> → Değişken boyutlu float3 listesi
+//   Bu listeyi CPU tarafında (WorldSpaceEdgeManager) okuyup RANSAC'a veriyoruz.
+//
+// PİPELİNE'DAKİ YERİ:
+//   [EdgeDetection.shader] → _EdgeTex ──┐
+//                                        ├→ [BU COMPUTE SHADER] → [float3 listesi] → [RANSAC]
+//   [WorldPosBuffer.shader] → _WorldPosTex ┘
+//
+// PERFORMANS:
+//   _Step parametresi ile her N. piksel örneklenir (downsampling).
+//   Thread dispatch sayısı _Step'e bölünerek boşa çalışan thread sıfırlanır.
+//   numthreads(16,16) = 256 thread/grup → iyi GPU occupancy.
+// ============================================================
+
+// Kernel fonksiyonunu tanımla (CPU tarafından FindKernel("ExtractPoints") ile bulunur)
 #pragma kernel ExtractPoints
 
+// ==================== GİRDİ TEXTURE'LARI ====================
+
+// Kenar algılama sonucu (siyah-beyaz)
+// R kanalı: 0.0 = kenar yok, 1.0 = güçlü kenar
+// EdgeDetectionEffect.cs tarafından üretilir
 Texture2D<float4> _EdgeTex;
+
+// Dünya pozisyon haritası (128-bit float)
+// Her piksel: (x, y, z, w) → x,y,z = dünya koordinatı, w = geçerlilik
+// WorldPosBuffer.shader tarafından üretilir, RenderWithShader ile
 Texture2D<float4> _WorldPosTex;
 
+// ==================== ÇIKTI BUFFER ====================
+
+// Bulunan 3D kenar noktalarının listesi
+// AppendStructuredBuffer: GPU tarafında thread-safe dinamik liste
+// .Append() çağrıldığında atomik olarak sonraki boş yere yazar
+// CPU tarafında ComputeBuffer.CopyCount ile kaç eleman yazıldığı okunur
 AppendStructuredBuffer<float3> _PointBuffer;
 
+// ==================== PARAMETRELER ====================
+
+// Minimum kenar parlaklığı eşiği
+// Bu değerin altındaki piksel kenar sayılmaz
+// Inspector'dan ayarlanır (WorldSpaceEdgeManager.minEdgeLuminance)
 float _MinEdgeThreshold;
+
+// Örnekleme adımı (downsampling faktörü)
+// 1 = her piksel, 2 = her 2. piksel, 4 = her 4. piksel ...
+// Büyük değerler daha hızlı ama daha düşük kalite
+// Inspector'dan ayarlanır (WorldSpaceEdgeManager.pixelStep)
 int _Step;
 
-// İYİLEŞTİRME: Boyutları CPU'dan uniform olarak alıyoruz
-// GetDimensions() her thread'de çağrılmak yerine bir kere set edilir
+// Texture boyutları — CPU'dan uniform olarak geçirilir
+// GetDimensions() çağrısını her thread'de tekrarlamak yerine
+// tek seferde SetInt ile gönderilir
 int _TexWidth;
 int _TexHeight;
 
-// İYİLEŞTİRME: 16x16 = 256 thread → daha iyi warp/wavefront occupancy
-// (8x8 = 64 thread, bazı GPU'larda yarım warp israfı)
+// ==================== KERNEL FONKSİYONU ====================
+
+// numthreads(16, 16, 1):
+//   Her thread grubu 16×16 = 256 thread içerir.
+//   GPU, bu grupları paralel olarak çalıştırır (warp/wavefront).
+//   256 thread, çoğu GPU'nun warp boyutuna (32/64) tam bölünür
+//   → boşa çalışan thread olmaz.
+//
+// SV_DispatchThreadID:
+//   Her thread'in benzersiz (x, y, z) kimliği.
+//   Dispatch(groupsX, groupsY, 1) çağrısı ile:
+//     id.x = 0 .. (groupsX × 16 - 1)
+//     id.y = 0 .. (groupsY × 16 - 1)
 [numthreads(16, 16, 1)]
 void ExtractPoints(uint3 id : SV_DispatchThreadID)
 {
+    // ========== PİKSEL KOORDİNATI HESAPLA ==========
+    // Thread ID'yi _Step ile çarparak gerçek piksel koordinatını bul.
+    //
+    // Örnek (_Step=4, 1920×1080 ekran):
+    //   Thread (0,0) → piksel (0,0)
+    //   Thread (1,0) → piksel (4,0)
+    //   Thread (2,0) → piksel (8,0)
+    //   ...
+    //   Thread (479,269) → piksel (1916, 1076)
+    //
+    // CPU tarafında dispatch sayısı da buna göre ayarlanır:
+    //   groupsX = ceil(1920 / (16 × 4)) = 30 grup
+    //   groupsY = ceil(1080 / (16 × 4)) = 17 grup
+    //   Toplam: 30×17×256 = ~130K thread (hepsi iş yapıyor)
+    //
+    // Eski yöntemde 1920×1080 = 2M thread dispatch edilip
+    // %93.75'i "if (id.x % 4 != 0) return;" ile atılıyordu.
     uint px = id.x * _Step;
     uint py = id.y * _Step;
     
-    // Sınır kontrolü (uniform'dan — GetDimensions yok)
+    // Texture sınırları dışına çıkan thread'leri atla
+    // (Son grup sınırda taşabilir — ör: 1920/64 = 30.0 tam bölünse bile
+    //  farklı çözünürlüklerde taşma olabilir)
     if (px >= (uint)_TexWidth || py >= (uint)_TexHeight) return;
     
+    // Örneklenecek piksel koordinatı
     uint2 coord = uint2(px, py);
     
+    // ========== KENAR KONTROLÜ ==========
+    // Edge texture'ından bu pikselin kenar değerini oku
+    // .r kanalı = kenar gücü (0.0 - 1.0)
     float edgeVal = _EdgeTex[coord].r;
     
+    // Eşik değerinin üzerindeyse → bu bir kenar pikseli
     if (edgeVal > _MinEdgeThreshold)
     {
+        // ========== 3D POZİSYON OKUMA ==========
+        // WorldPos texture'ından bu pikselin dünya koordinatını oku
+        // float4: (x, y, z, w) → xyz = konum, w = geçerlilik bayrağı
         float4 worldPos = _WorldPosTex[coord];
+        
+        // w > 0 kontrolü: Skybox veya boş alan piksellerini filtrele
+        // WorldPosBuffer.shader boş alanlar için siyah (0,0,0,0) yazar
+        // Sadece gerçek obje pikselleri w=1.0 değerine sahiptir
         if (worldPos.w > 0)
         {
+            // ========== BUFFER'A EKLE ==========
+            // Bu 3D noktayı listeye ekle
+            // .Append() atomik bir işlemdir — birden fazla thread aynı anda
+            // çağırsa bile veri kaybı olmaz (GPU donanımı garanti eder)
+            // Sonuç: RANSAC'a verilecek 3D nokta bulutu
             _PointBuffer.Append(worldPos.xyz);
         }
     }
