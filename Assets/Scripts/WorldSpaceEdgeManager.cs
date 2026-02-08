@@ -137,10 +137,19 @@ namespace SceneCapture.Edge3D
             pointExtractorCS.SetFloat("_MinEdgeThreshold", minEdgeLuminance);
             
             pointExtractorCS.SetInt("_Step", pixelStep); 
+            
+            // İYİLEŞTİRME: Boyutları uniform olarak geçir (GetDimensions yerine)
+            pointExtractorCS.SetInt("_TexWidth", Screen.width);
+            pointExtractorCS.SetInt("_TexHeight", Screen.height);
+            
             pointExtractorCS.SetBuffer(kernel, "_PointBuffer", _pointBuffer);
 
-            int groupsX = Mathf.CeilToInt(Screen.width / 8.0f);
-            int groupsY = Mathf.CeilToInt(Screen.height / 8.0f);
+            // İYİLEŞTİRME: Dispatch sayısını _Step'e böl
+            // ESKİ: tüm pixeller dispatch → %94'ü boşa (Step=4)
+            // YENİ: sadece örneklenecek pixeller dispatch → sıfır israf
+            // numthreads(16,16,1) olduğu için 16'ya bölüyoruz
+            int groupsX = Mathf.CeilToInt((float)Screen.width / (16 * pixelStep));
+            int groupsY = Mathf.CeilToInt((float)Screen.height / (16 * pixelStep));
             pointExtractorCS.Dispatch(kernel, groupsX, groupsY, 1);
 
             ComputeBuffer.CopyCount(_pointBuffer, _argsBuffer, 0);
