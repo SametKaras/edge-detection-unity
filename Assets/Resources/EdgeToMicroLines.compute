@@ -1,0 +1,150 @@
+// EdgeToMicroLines.compute
+// 5×5 Kernel RANSAC — sade ve hızlı
+// Her tile'dan tek micro-line çıkarır
+
+#pragma kernel FitMicroLines
+
+#define MAX_PTS 25   // 5×5 = max 25 nokta
+
+Texture2D<float4> _EdgeTex;
+Texture2D<float4> _WorldPosTex;
+
+struct MicroLine
+{
+    float sx, sy, sz;
+    float ex, ey, ez;
+};
+
+AppendStructuredBuffer<MicroLine> _OutputLines;
+
+int   _KernelSize;
+float _MinEdgeThreshold;
+int   _MinPointsForLine;
+float _InlierThreshold;
+float _MaxSegLength;
+int   _TexWidth;
+int   _TexHeight;
+uint  _FrameSeed;
+
+uint WangHash(uint seed)
+{
+    seed = (seed ^ 61u) ^ (seed >> 16u);
+    seed *= 9u;
+    seed = seed ^ (seed >> 4u);
+    seed *= 0x27d4eb2du;
+    seed = seed ^ (seed >> 15u);
+    return seed;
+}
+
+[numthreads(8, 8, 1)]
+void FitMicroLines(uint3 id : SV_DispatchThreadID)
+{
+    int startX = id.x * _KernelSize;
+    int startY = id.y * _KernelSize;
+    if (startX >= _TexWidth || startY >= _TexHeight) return;
+
+    int endX = min(startX + _KernelSize, _TexWidth);
+    int endY = min(startY + _KernelSize, _TexHeight);
+
+    // ===== 1. EDGE NOKTALARINI TOPLA =====
+    float3 pts[MAX_PTS];
+    int cnt = 0;
+
+    for (int py = startY; py < endY; py++)
+    {
+        for (int px = startX; px < endX; px++)
+        {
+            if (_EdgeTex[uint2(px, py)].r <= _MinEdgeThreshold) continue;
+
+            float4 wp = _WorldPosTex[uint2(px, py)];
+            if (wp.w <= 0) continue;
+
+            pts[cnt] = wp.xyz;
+            cnt++;
+            if (cnt >= MAX_PTS) break;
+        }
+        if (cnt >= MAX_PTS) break;
+    }
+
+    if (cnt < _MinPointsForLine) return;
+
+    // ===== 2. RANSAC =====
+    float thSq  = _InlierThreshold * _InlierThreshold;
+    float segSq = _MaxSegLength * _MaxSegLength;
+
+    uint seed = WangHash(id.x + id.y * 65537u + _FrameSeed * 7919u + 1u);
+
+    int bestCount = 0;
+    float3 bestA  = float3(0, 0, 0);
+    float3 bestB  = float3(0, 0, 0);
+
+    int maxIter = min(15, cnt * (cnt - 1) / 2);
+
+    for (int it = 0; it < maxIter; it++)
+    {
+        seed = WangHash(seed);
+        int i1 = seed % (uint)cnt;
+
+        seed = WangHash(seed);
+        int i2 = seed % (uint)cnt;
+        if (i2 == i1) continue;
+
+        float3 a = pts[i1];
+        float3 b = pts[i2];
+
+        float3 ab = b - a;
+        float abLenSq = dot(ab, ab);
+        if (abLenSq > segSq || abLenSq < 1e-16) continue;
+
+        float3 dir = ab / sqrt(abLenSq);
+
+        int inl = 0;
+        for (int k = 0; k < cnt; k++)
+        {
+            float3 d = pts[k] - a;
+            float3 cr = cross(d, dir);
+            if (dot(cr, cr) < thSq) inl++;
+        }
+
+        if (inl > bestCount)
+        {
+            bestCount = inl;
+            bestA = a;
+            bestB = b;
+        }
+    }
+
+    if (bestCount < _MinPointsForLine) return;
+
+    // ===== 3. SEGMENT UÇ NOKTALARINI BUL =====
+    float3 bestDir = bestB - bestA;
+    float bdLen = length(bestDir);
+    if (bdLen < 1e-8) return;
+    bestDir /= bdLen;
+
+    float minP =  1e10;
+    float maxP = -1e10;
+
+    for (int k = 0; k < cnt; k++)
+    {
+        float3 d = pts[k] - bestA;
+        float3 cr = cross(d, bestDir);
+        if (dot(cr, cr) < thSq)
+        {
+            float p = dot(d, bestDir);
+            minP = min(minP, p);
+            maxP = max(maxP, p);
+        }
+    }
+
+    if (maxP - minP < 1e-8) return;
+
+    // ===== 4. SONUÇ =====
+    float3 segStart = bestA + bestDir * minP;
+    float3 segEnd   = bestA + bestDir * maxP;
+
+    MicroLine ml;
+    ml.sx = segStart.x; ml.sy = segStart.y; ml.sz = segStart.z;
+    ml.ex = segEnd.x;   ml.ey = segEnd.y;   ml.ez = segEnd.z;
+    _OutputLines.Append(ml);
+}
