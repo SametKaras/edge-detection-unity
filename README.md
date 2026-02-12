@@ -1,6 +1,6 @@
-# 🔍 Unity Edge Detection & Line Detection System
+# 🔍 Unity Edge Detection & 3D Line Detection System
 
-A real-time edge detection and 3D line segment extraction system for Unity, featuring **Hough Transform** and **RANSAC** algorithms optimized with **Burst Compiler**.
+A real-time edge detection and 3D line segment extraction system for Unity, featuring **GPU-based RANSAC** and **Hough Transform** with **Burst Compiler** optimization.
 
 ![Unity](https://img.shields.io/badge/Unity-2021.3+-black?logo=unity)
 ![License](https://img.shields.io/badge/License-MIT-green)
@@ -12,11 +12,11 @@ A real-time edge detection and 3D line segment extraction system for Unity, feat
 
 - **Multiple Edge Detection Kernels**: Sobel, Roberts, Prewitt operators
 - **Multiple Data Sources**: Luminance, Depth, Normals, or Combined mode
-- **Hough Transform**: Real-time 2D line segment detection
-- **RANSAC 3D Line Fitting**: Extract 3D line segments from point clouds
-- **Burst Compiler Optimization**: 43x speedup on Hough Transform voting
+- **GPU RANSAC (MicroLines)**: Per-tile 3D line fitting entirely on GPU
+- **Hough Transform**: Real-time 2D line segment detection (Burst optimized)
 - **Async GPU Readback**: Non-blocking GPU→CPU data transfer
-- **Interactive Visualization**: Debug panels, normal arrows, segment info
+- **Real-Time Performance HUD**: Algorithm time, readback time, line count
+- **Interactive Visualization**: Debug panels, normal arrows, Gizmo lines
 
 ---
 
@@ -32,36 +32,33 @@ A real-time edge detection and 3D line segment extraction system for Unity, feat
 
 ```
                         ┌─────────────────────────────────┐
-                        │         Camera Render           │
-                        └────────────────┬────────────────┘
+                        │         Camera Render            │
+                        └────────────────┬─────────────────┘
                                          ▼
                         ┌─────────────────────────────────┐
-                        │   EdgeDetection.shader (GPU)    │
-                        │   • Sobel/Roberts/Prewitt       │
-                        │   • Depth/Normal/Color/Combined │
-                        └────────────────┬────────────────┘
+                        │   EdgeDetection.shader (GPU)     │
+                        │   • Sobel/Roberts/Prewitt        │
+                        │   • Depth/Normal/Color/Combined  │
+                        └────────────────┬─────────────────┘
                                          ▼
               ┌──────────────────────────┴──────────────────────────┐
-              ▼                                                      ▼
-┌──────────────────────────┐                          ┌──────────────────────────┐
-│  EdgeDirection.shader    │                          │  WorldPosBuffer.shader   │
-│  (Gradient Direction)    │                          │  (3D World Positions)    │
-└────────────┬─────────────┘                          └────────────┬─────────────┘
-             │                                                      │
-             └──────────────────────────┬───────────────────────────┘
-                                        ▼
-                        ┌─────────────────────────────────┐
-                        │      AsyncGPUReadback           │
-                        │      (GPU → CPU Transfer)       │
-                        └────────────────┬────────────────┘
-                                         ▼
-              ┌──────────────────────────┴──────────────────────────┐
-              ▼                                                      ▼
-┌──────────────────────────┐                          ┌──────────────────────────┐
-│   HoughLineDetector      │                          │  WorldSpaceEdgeManager   │
-│   (2D Line Segments)     │                          │  (3D RANSAC Fitting)     │
-│   • Burst Optimized      │                          │  • Burst Optimized       │
-└──────────────────────────┘                          └──────────────────────────┘
+              ▼                                                     ▼
+┌──────────────────────────┐                         ┌──────────────────────────┐
+│  EdgeDirection.shader    │                         │  WorldPosBuffer.shader   │
+│  (Gradient Direction)    │                         │  (3D World Positions)    │
+└────────────┬─────────────┘                         └────────────┬─────────────┘
+             │                                                     │
+             ▼                                                     ▼
+┌──────────────────────────┐                         ┌──────────────────────────┐
+│   HoughLineDetector      │                         │  EdgeToMicroLines.compute│
+│   (2D Line Segments)     │                         │  (GPU RANSAC per Tile)   │
+│   • Burst Optimized      │                         │  • No CPU overhead       │
+└──────────────────────────┘                         └────────────┬─────────────┘
+                                                                  ▼
+                                                     ┌──────────────────────────┐
+                                                     │  WorldSpaceEdgeManager   │
+                                                     │  (Async Readback + Gizmo)│
+                                                     └──────────────────────────┘
 ```
 
 ---
@@ -95,21 +92,20 @@ A real-time edge detection and 3D line segment extraction system for Unity, feat
 Assets/
 ├── Scripts/
 │   ├── SceneCapture/
-│   │   └── EdgeDetectionEffect.cs    # Post-processing edge detection
+│   │   └── EdgeDetectionEffect.cs     # Post-processing edge detection
 │   ├── HoughTransform/
-│   │   ├── EdgeFrameProcessor.cs     # GPU→CPU async transfer
-│   │   ├── HoughLineDetector.cs      # Burst-optimized Hough Transform
-│   │   ├── HoughNormalVisualizer.cs  # Debug visualization
-│   │   └── LineSegment2D.cs          # Data structures
-│   ├── WorldSpaceEdgeManager.cs      # 3D RANSAC line fitting
-│   └── RansacLineFitter.cs           # Alternative RANSAC implementation
+│   │   ├── EdgeFrameProcessor.cs      # GPU→CPU async transfer
+│   │   ├── HoughLineDetector.cs       # Burst-optimized Hough Transform
+│   │   ├── HoughNormalVisualizer.cs   # Debug visualization & kernel comparison
+│   │   └── LineSegment2D.cs           # Data structures & parameters
+│   └── WorldSpaceEdgeManager.cs       # GPU RANSAC pipeline manager
 ├── Shaders/
-│   ├── EdgeDetection.shader          # Multi-kernel edge detection
-│   ├── EdgeDirection.shader          # Gradient direction extraction
-│   └── WorldPosBuffer.shader         # World position buffer
+│   ├── EdgeDetection.shader           # Multi-kernel edge detection
+│   ├── EdgeDirection.shader           # Multi-source gradient extraction
+│   └── WorldPosBuffer.shader          # World position buffer
 ├── Resources/
-│   └── EdgeToPointCloud.compute      # GPU point extraction
-├── Captures/                          # Test capture images
+│   └── EdgeToMicroLines.compute       # GPU RANSAC per-tile line fitting
+├── Captures/                           # Test capture images
 └── Scenes/
     └── SampleScene.unity
 ```
@@ -137,16 +133,35 @@ Assets/
 | `Max Lines` | 10 - 500 | Maximum segments to detect |
 | `Segment Min Length` | 3 - 100 | Minimum segment length (px) |
 
+### 3D Line Detection (GPU RANSAC)
+
+| Parameter | Range | Description |
+|-----------|-------|-------------|
+| `Kernel Size` | 3 - 7 | Tile size for per-tile RANSAC |
+| `Min Points For Line` | 2 - 25 | Minimum edge points to fit a line |
+| `Inlier Threshold` | 0.01 - 0.5 | Max distance for inlier classification |
+| `Max Segment Length` | 0.01 - 10 | Maximum length of detected segments |
+
 ---
 
 ## ⚡ Performance
+
+### Hough Transform (CPU)
 
 | Optimization | Speedup | Description |
 |--------------|---------|-------------|
 | Burst Compiler | **43x** | VoteJob: 350ms → 8ms |
 | Sin/Cos Lookup | 10-20x | Pre-computed tables |
 | Gradient-Guided Voting | 78% less work | Vote only near gradient direction |
-| Async GPU Readback | ∞ | Non-blocking transfer |
+
+### 3D Line Detection (GPU)
+
+| Feature | Description |
+|---------|-------------|
+| GPU RANSAC | Entire RANSAC runs on GPU — zero CPU overhead |
+| Per-Tile Processing | Each 5×5 tile fits one micro-line independently |
+| Async Readback | Results transferred without blocking main thread |
+| Real-Time HUD | Algorithm time, readback time, line count overlay |
 
 ---
 
