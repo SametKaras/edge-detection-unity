@@ -105,7 +105,7 @@ namespace SceneCapture.Edge3D
 
         void Update()
         {
-            // 1. Async readback sonuçlarını kontrol et
+            // 1. Async readback sonuÃ§larÄ±nÄ± kontrol et
             PollReadback();
 
             // 2. Yeni frame dispatch et (sadece idle ise)
@@ -137,7 +137,7 @@ namespace SceneCapture.Edge3D
             _posCam.targetTexture = _worldPosRT;
             _posCam.RenderWithShader(worldPosShader, "RenderType");
 
-            // Compute shader dispatch — Profiler marker ile
+            // Compute shader dispatch â€” Profiler marker ile
             _lineBuffer.SetCounterValue(0);
             int kernel = microLineCS.FindKernel("FitMicroLines");
 
@@ -166,7 +166,7 @@ namespace SceneCapture.Edge3D
             UnityEngine.Profiling.Profiler.EndSample();
             // === ALGORITHM TIMING END ===
 
-            // Async readback başlat (CPU'yu bloklamaz!)
+            // Async readback baÅŸlat (CPU'yu bloklamaz!)
             ComputeBuffer.CopyCount(_lineBuffer, _countBuffer, 0);
             _countReq = AsyncGPUReadback.Request(_countBuffer);
             _rbState = ReadbackState.WaitingCount;
@@ -277,7 +277,7 @@ namespace SceneCapture.Edge3D
                           $"Algorithm:  <color={algoColor}>{_algorithmMs:F4} ms</color>\n" +
                           $"Readback:   {_readbackMs:F2} ms  <color=#888888>(async)</color>\n" +
                           $"Lines:      {_lineCountDisplay}\n" +
-                          $"Kernel:     {kernelSize}×{kernelSize}";
+                          $"Kernel:     {kernelSize}Ã—{kernelSize}";
 
             GUI.Box(new Rect(10, 10, 300, 115), info, style);
         }
