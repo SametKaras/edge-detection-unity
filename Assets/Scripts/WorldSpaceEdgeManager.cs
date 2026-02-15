@@ -47,8 +47,8 @@ namespace SceneCapture.Edge3D
 
         [Header("Performance (Read-Only)")]
         public bool showPerformance = true;
-        [SerializeField] private float _algorithmMs;   // Compute dispatch + GPU fence
-        [SerializeField] private float _readbackMs;     // Async readback tamamlanma
+        [SerializeField] private float _algorithmMs;
+        [SerializeField] private float _readbackMs;
         [SerializeField] private float _totalPipelineMs;
         [SerializeField] private int   _lineCountDisplay;
 
@@ -105,7 +105,7 @@ namespace SceneCapture.Edge3D
 
         void Update()
         {
-            // 1. Async readback sonuÃ§larÄ±nÄ± kontrol et
+            // 1. Async readback sonuçlarını kontrol et
             PollReadback();
 
             // 2. Yeni frame dispatch et (sadece idle ise)
@@ -137,7 +137,7 @@ namespace SceneCapture.Edge3D
             _posCam.targetTexture = _worldPosRT;
             _posCam.RenderWithShader(worldPosShader, "RenderType");
 
-            // Compute shader dispatch â€” Profiler marker ile
+            // Compute shader dispatch
             _lineBuffer.SetCounterValue(0);
             int kernel = microLineCS.FindKernel("FitMicroLines");
 
@@ -166,7 +166,7 @@ namespace SceneCapture.Edge3D
             UnityEngine.Profiling.Profiler.EndSample();
             // === ALGORITHM TIMING END ===
 
-            // Async readback baÅŸlat (CPU'yu bloklamaz!)
+            // Async readback başlat (CPU'yu bloklamaz!)
             ComputeBuffer.CopyCount(_lineBuffer, _countBuffer, 0);
             _countReq = AsyncGPUReadback.Request(_countBuffer);
             _rbState = ReadbackState.WaitingCount;
@@ -277,7 +277,7 @@ namespace SceneCapture.Edge3D
                           $"Algorithm:  <color={algoColor}>{_algorithmMs:F4} ms</color>\n" +
                           $"Readback:   {_readbackMs:F2} ms  <color=#888888>(async)</color>\n" +
                           $"Lines:      {_lineCountDisplay}\n" +
-                          $"Kernel:     {kernelSize}Ã—{kernelSize}";
+                          $"Kernel:     {kernelSize}×{kernelSize}";
 
             GUI.Box(new Rect(10, 10, 300, 115), info, style);
         }

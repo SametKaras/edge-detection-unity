@@ -78,7 +78,7 @@ void FitMicroLines(uint3 id : SV_DispatchThreadID)
     float3 bestA  = float3(0, 0, 0);
     float3 bestB  = float3(0, 0, 0);
 
-    int maxIter = min(15, cnt * (cnt - 1) / 2);
+    int maxIter = min(15, (int)((uint)cnt * ((uint)cnt - 1u) / 2u));
 
     for (int it = 0; it < maxIter; it++)
     {
