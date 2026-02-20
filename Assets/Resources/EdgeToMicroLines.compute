@@ -1,10 +1,11 @@
 // EdgeToMicroLines.compute
-// 5×5 Kernel RANSAC — sade ve hızlı
-// Her tile'dan tek micro-line çıkarır
+// Hybrid RANSAC: 2D önce dene (daha iyi kalite), başarısızsa 3D'ye düş
+// Silhouette edge'lerde offset ile tutarlı depth, crease edge'lerde orijinal WorldPos
 
 #pragma kernel FitMicroLines
 
-#define MAX_PTS 25   // 5×5 = max 25 nokta
+#define MAX_PTS 81   // 9×9 = max 81 nokta
+#define OFFSET  5    // Silhouette için piksel offset
 
 Texture2D<float4> _EdgeTex;
 Texture2D<float4> _WorldPosTex;
@@ -36,6 +37,24 @@ uint WangHash(uint seed)
     return seed;
 }
 
+// Edge pikselindeki Sobel gradyanı (kenara dik yön)
+float2 ComputeEdgeGradient(int px, int py)
+{
+    float tl = _EdgeTex[uint2(max(px-1,0),          max(py-1,0))].r;
+    float tc = _EdgeTex[uint2(px,                    max(py-1,0))].r;
+    float tr = _EdgeTex[uint2(min(px+1,_TexWidth-1), max(py-1,0))].r;
+    float ml = _EdgeTex[uint2(max(px-1,0),           py)].r;
+    float mr = _EdgeTex[uint2(min(px+1,_TexWidth-1), py)].r;
+    float bl = _EdgeTex[uint2(max(px-1,0),           min(py+1,_TexHeight-1))].r;
+    float bc = _EdgeTex[uint2(px,                    min(py+1,_TexHeight-1))].r;
+    float br = _EdgeTex[uint2(min(px+1,_TexWidth-1), min(py+1,_TexHeight-1))].r;
+
+    float gx = (tr + 2*mr + br) - (tl + 2*ml + bl);
+    float gy = (bl + 2*bc + br) - (tl + 2*tc + tr);
+
+    return float2(gx, gy);
+}
+
 [numthreads(8, 8, 1)]
 void FitMicroLines(uint3 id : SV_DispatchThreadID)
 {
@@ -46,8 +65,58 @@ void FitMicroLines(uint3 id : SV_DispatchThreadID)
     int endX = min(startX + _KernelSize, _TexWidth);
     int endY = min(startY + _KernelSize, _TexHeight);
 
-    // ===== 1. EDGE NOKTALARINI TOPLA =====
-    float3 pts[MAX_PTS];
+    // ===== 0. EDGE TİPİNİ BELİRLE =====
+    float2 avgGrad = float2(0, 0);
+    int edgeCount = 0;
+
+    for (int ay = startY; ay < endY; ay++)
+    {
+        for (int ax = startX; ax < endX; ax++)
+        {
+            if (_EdgeTex[uint2(ax, ay)].r > _MinEdgeThreshold)
+            {
+                avgGrad += ComputeEdgeGradient(ax, ay);
+                edgeCount++;
+            }
+        }
+    }
+
+    if (edgeCount < _MinPointsForLine) return;
+
+    bool isSilhouette = false;
+    float2 silhouetteDir = float2(0, 0);
+
+    float glen = length(avgGrad);
+    if (glen > 1e-4)
+    {
+        float2 perpDir = avgGrad / glen;
+
+        int cx = (startX + endX) / 2;
+        int cy = (startY + endY) / 2;
+
+        int ox1 = clamp(cx + (int)(perpDir.x * OFFSET), 0, _TexWidth  - 1);
+        int oy1 = clamp(cy + (int)(perpDir.y * OFFSET), 0, _TexHeight - 1);
+        int ox2 = clamp(cx - (int)(perpDir.x * OFFSET), 0, _TexWidth  - 1);
+        int oy2 = clamp(cy - (int)(perpDir.y * OFFSET), 0, _TexHeight - 1);
+
+        bool v1 = (_WorldPosTex[uint2(ox1, oy1)].w > 0);
+        bool v2 = (_WorldPosTex[uint2(ox2, oy2)].w > 0);
+
+        if (v1 && !v2)
+        {
+            isSilhouette = true;
+            silhouetteDir = perpDir;
+        }
+        else if (!v1 && v2)
+        {
+            isSilhouette = true;
+            silhouetteDir = -perpDir;
+        }
+    }
+
+    // ===== 1. EDGE NOKTALARINI TOPLA (2D + 3D) =====
+    float2 pts2d[MAX_PTS];
+    float3 pts3d[MAX_PTS];
     int cnt = 0;
 
     for (int py = startY; py < endY; py++)
@@ -56,10 +125,22 @@ void FitMicroLines(uint3 id : SV_DispatchThreadID)
         {
             if (_EdgeTex[uint2(px, py)].r <= _MinEdgeThreshold) continue;
 
-            float4 wp = _WorldPosTex[uint2(px, py)];
+            float4 wp;
+            if (isSilhouette)
+            {
+                int ox = clamp(px + (int)(silhouetteDir.x * OFFSET), 0, _TexWidth  - 1);
+                int oy = clamp(py + (int)(silhouetteDir.y * OFFSET), 0, _TexHeight - 1);
+                wp = _WorldPosTex[uint2(ox, oy)];
+            }
+            else
+            {
+                wp = _WorldPosTex[uint2(px, py)];
+            }
+
             if (wp.w <= 0) continue;
 
-            pts[cnt] = wp.xyz;
+            pts2d[cnt] = float2(px, py);
+            pts3d[cnt] = wp.xyz;
             cnt++;
             if (cnt >= MAX_PTS) break;
         }
@@ -68,29 +149,136 @@ void FitMicroLines(uint3 id : SV_DispatchThreadID)
 
     if (cnt < _MinPointsForLine) return;
 
-    // ===== 2. RANSAC =====
-    float thSq  = _InlierThreshold * _InlierThreshold;
-    float segSq = _MaxSegLength * _MaxSegLength;
+    float thSq3D = _InlierThreshold * _InlierThreshold;
+    float segSq  = _MaxSegLength * _MaxSegLength;
 
     uint seed = WangHash(id.x + id.y * 65537u + _FrameSeed * 7919u + 1u);
 
-    int bestCount = 0;
-    float3 bestA  = float3(0, 0, 0);
-    float3 bestB  = float3(0, 0, 0);
+    // =========================================================
+    // AŞAMA A: 2D RANSAC DENEMESİ (daha iyi kalite)
+    // =========================================================
+    bool found2D = false;
+    float3 result2D_start = float3(0,0,0);
+    float3 result2D_end   = float3(0,0,0);
+    {
+        float thSq2D = 2.25;  // 1.5 piksel
+        int bestCount2D = 0;
+        int bestI1 = 0;
+        int bestI2 = 0;
+        float2 bestA2d = float2(0, 0);
+        float2 bestDir2d = float2(0, 0);
 
-    int maxIter = min(15, (int)((uint)cnt * ((uint)cnt - 1u) / 2u));
+        uint seed2d = seed;
+        int maxIter = min(30, (int)((uint)cnt * ((uint)cnt - 1u) / 2u));
 
-    for (int it = 0; it < maxIter; it++)
+        for (int it = 0; it < maxIter; it++)
+        {
+            seed2d = WangHash(seed2d);
+            int i1 = seed2d % (uint)cnt;
+            seed2d = WangHash(seed2d);
+            int i2 = seed2d % (uint)cnt;
+            if (i2 == i1) continue;
+
+            float2 a = pts2d[i1];
+            float2 b = pts2d[i2];
+            float2 ab = b - a;
+            float abLenSq = dot(ab, ab);
+            if (abLenSq < 1.0) continue;
+
+            // 3D mesafe kontrolü (aday çifti aynı yüzeyde mi?)
+            float3 ab3d = pts3d[i2] - pts3d[i1];
+            if (dot(ab3d, ab3d) > segSq) continue;
+
+            float2 dir = ab / sqrt(abLenSq);
+
+            int inl = 0;
+            for (int k = 0; k < cnt; k++)
+            {
+                float2 ap = pts2d[k] - a;
+                float crossVal = ap.x * dir.y - ap.y * dir.x;
+                if (crossVal * crossVal < thSq2D) inl++;
+            }
+
+            if (inl > bestCount2D)
+            {
+                bestCount2D = inl;
+                bestI1 = i1;
+                bestI2 = i2;
+                bestA2d = a;
+                bestDir2d = dir;
+            }
+        }
+
+        if (bestCount2D >= _MinPointsForLine)
+        {
+            // Aday çiftin 3D yönü ile endpoint hesapla
+            float3 a3d = pts3d[bestI1];
+            float3 dir3d = pts3d[bestI2] - a3d;
+            float dirLen = length(dir3d);
+
+            if (dirLen > 1e-8)
+            {
+                dir3d /= dirLen;
+
+                float minP = 1e10;
+                float maxP = -1e10;
+
+                for (int k = 0; k < cnt; k++)
+                {
+                    float2 ap2 = pts2d[k] - bestA2d;
+                    float cv = ap2.x * bestDir2d.y - ap2.y * bestDir2d.x;
+                    if (cv * cv >= 2.25) continue;
+
+                    float3 d = pts3d[k] - a3d;
+                    float3 cr = cross(d, dir3d);
+                    if (dot(cr, cr) < thSq3D)
+                    {
+                        float p = dot(d, dir3d);
+                        minP = min(minP, p);
+                        maxP = max(maxP, p);
+                    }
+                }
+
+                float segLen = maxP - minP;
+                if (segLen > 1e-8 && segLen <= _MaxSegLength)
+                {
+                    found2D = true;
+                    result2D_start = a3d + dir3d * minP;
+                    result2D_end   = a3d + dir3d * maxP;
+                }
+            }
+        }
+    }
+
+    // 2D başarılıysa çıktı ver
+    if (found2D)
+    {
+        MicroLine ml;
+        ml.sx = result2D_start.x; ml.sy = result2D_start.y; ml.sz = result2D_start.z;
+        ml.ex = result2D_end.x;   ml.ey = result2D_end.y;   ml.ez = result2D_end.z;
+        _OutputLines.Append(ml);
+        return;
+    }
+
+    // =========================================================
+    // AŞAMA B: 3D RANSAC FALLBACK (güvenilir kapsam)
+    // =========================================================
+    int bestCount3D = 0;
+    float3 bestA = float3(0, 0, 0);
+    float3 bestB = float3(0, 0, 0);
+
+    int maxIter3D = min(30, (int)((uint)cnt * ((uint)cnt - 1u) / 2u));
+
+    for (int it = 0; it < maxIter3D; it++)
     {
         seed = WangHash(seed);
         int i1 = seed % (uint)cnt;
-
         seed = WangHash(seed);
         int i2 = seed % (uint)cnt;
         if (i2 == i1) continue;
 
-        float3 a = pts[i1];
-        float3 b = pts[i2];
+        float3 a = pts3d[i1];
+        float3 b = pts3d[i2];
 
         float3 ab = b - a;
         float abLenSq = dot(ab, ab);
@@ -101,35 +289,34 @@ void FitMicroLines(uint3 id : SV_DispatchThreadID)
         int inl = 0;
         for (int k = 0; k < cnt; k++)
         {
-            float3 d = pts[k] - a;
+            float3 d = pts3d[k] - a;
             float3 cr = cross(d, dir);
-            if (dot(cr, cr) < thSq) inl++;
+            if (dot(cr, cr) < thSq3D) inl++;
         }
 
-        if (inl > bestCount)
+        if (inl > bestCount3D)
         {
-            bestCount = inl;
+            bestCount3D = inl;
             bestA = a;
             bestB = b;
         }
     }
 
-    if (bestCount < _MinPointsForLine) return;
+    if (bestCount3D < _MinPointsForLine) return;
 
-    // ===== 3. SEGMENT UÇ NOKTALARINI BUL =====
     float3 bestDir = bestB - bestA;
     float bdLen = length(bestDir);
     if (bdLen < 1e-8) return;
     bestDir /= bdLen;
 
-    float minP =  1e10;
+    float minP = 1e10;
     float maxP = -1e10;
 
     for (int k = 0; k < cnt; k++)
     {
-        float3 d = pts[k] - bestA;
+        float3 d = pts3d[k] - bestA;
         float3 cr = cross(d, bestDir);
-        if (dot(cr, cr) < thSq)
+        if (dot(cr, cr) < thSq3D)
         {
             float p = dot(d, bestDir);
             minP = min(minP, p);
@@ -139,7 +326,6 @@ void FitMicroLines(uint3 id : SV_DispatchThreadID)
 
     if (maxP - minP < 1e-8) return;
 
-    // ===== 4. SONUÇ =====
     float3 segStart = bestA + bestDir * minP;
     float3 segEnd   = bestA + bestDir * maxP;
 
