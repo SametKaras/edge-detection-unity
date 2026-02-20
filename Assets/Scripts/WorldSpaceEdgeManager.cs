@@ -10,6 +10,14 @@ using UnityEditor;
 
 namespace SceneCapture.Edge3D
 {
+    public enum KernelSizeOption
+    {
+        _3x3 = 3,
+        _5x5 = 5,
+        _7x7 = 7,
+        _9x9 = 9
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     public struct MicroLine
     {
@@ -31,7 +39,7 @@ namespace SceneCapture.Edge3D
         [Range(0.01f, 0.9f)] public float minEdgeLuminance = 0.1f;
 
         [Header("RANSAC (Kernel)")]
-        [Range(3, 7)] public int kernelSize = 5;
+        public KernelSizeOption kernelSize = KernelSizeOption._5x5;
         [Range(2, 25)] public int minPointsForLine = 2;
         [Range(0.01f, 0.5f)] public float inlierThreshold = 0.08f;
         [Range(0.01f, 10f)] public float maxSegmentLength = 0.15f;
@@ -144,7 +152,8 @@ namespace SceneCapture.Edge3D
             microLineCS.SetTexture(kernel, "_EdgeTex", _edgeEffect.EdgeResultTexture);
             microLineCS.SetTexture(kernel, "_WorldPosTex", _worldPosRT);
             microLineCS.SetFloat("_MinEdgeThreshold", minEdgeLuminance);
-            microLineCS.SetInt("_KernelSize", kernelSize);
+            int k = (int)kernelSize;
+            microLineCS.SetInt("_KernelSize", k);
             microLineCS.SetInt("_MinPointsForLine", minPointsForLine);
             microLineCS.SetFloat("_InlierThreshold", inlierThreshold);
             microLineCS.SetFloat("_MaxSegLength", maxSegmentLength);
@@ -153,8 +162,8 @@ namespace SceneCapture.Edge3D
             microLineCS.SetBuffer(kernel, "_OutputLines", _lineBuffer);
             microLineCS.SetInt("_FrameSeed", Time.frameCount);
 
-            int tilesX = Mathf.CeilToInt((float)Screen.width / kernelSize);
-            int tilesY = Mathf.CeilToInt((float)Screen.height / kernelSize);
+            int tilesX = Mathf.CeilToInt((float)Screen.width / k);
+            int tilesY = Mathf.CeilToInt((float)Screen.height / k);
 
             // === ALGORITHM TIMING START ===
             UnityEngine.Profiling.Profiler.BeginSample("MicroLine_RANSAC_5x5");
