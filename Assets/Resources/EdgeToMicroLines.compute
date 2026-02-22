@@ -211,40 +211,88 @@ void FitMicroLines(uint3 id : SV_DispatchThreadID)
 
         if (bestCount2D >= _MinPointsForLine)
         {
-            // Aday çiftin 3D yönü ile endpoint hesapla
-            float3 a3d = pts3d[bestI1];
-            float3 dir3d = pts3d[bestI2] - a3d;
-            float dirLen = length(dir3d);
+            // ===== CENTROID-BASED 3D YÖN =====
+            // Tek aday çifti yerine, inlier'ları ikiye böl ve
+            // her yarının 3D centroid'ini hesapla → robust yön
 
-            if (dirLen > 1e-8)
+            // Pass 1: 2D inlier projeksiyonlarının min/max'ı
+            float minP2d =  1e10;
+            float maxP2d = -1e10;
+
+            for (int k = 0; k < cnt; k++)
             {
-                dir3d /= dirLen;
+                float2 ap2 = pts2d[k] - bestA2d;
+                float cv = ap2.x * bestDir2d.y - ap2.y * bestDir2d.x;
+                if (cv * cv >= 2.25) continue;
 
-                float minP = 1e10;
-                float maxP = -1e10;
+                float p = dot(ap2, bestDir2d);
+                minP2d = min(minP2d, p);
+                maxP2d = max(maxP2d, p);
+            }
 
-                for (int k = 0; k < cnt; k++)
+            float midP2d = (minP2d + maxP2d) * 0.5;
+
+            // Pass 2: İki yarının 3D centroid'leri
+            float3 centA = float3(0,0,0);
+            float3 centB = float3(0,0,0);
+            int cntA = 0, cntB = 0;
+
+            for (int k = 0; k < cnt; k++)
+            {
+                float2 ap2 = pts2d[k] - bestA2d;
+                float cv = ap2.x * bestDir2d.y - ap2.y * bestDir2d.x;
+                if (cv * cv >= 2.25) continue;
+
+                float p = dot(ap2, bestDir2d);
+                if (p < midP2d)
                 {
-                    float2 ap2 = pts2d[k] - bestA2d;
-                    float cv = ap2.x * bestDir2d.y - ap2.y * bestDir2d.x;
-                    if (cv * cv >= 2.25) continue;
-
-                    float3 d = pts3d[k] - a3d;
-                    float3 cr = cross(d, dir3d);
-                    if (dot(cr, cr) < thSq3D)
-                    {
-                        float p = dot(d, dir3d);
-                        minP = min(minP, p);
-                        maxP = max(maxP, p);
-                    }
+                    centA += pts3d[k]; cntA++;
                 }
-
-                float segLen = maxP - minP;
-                if (segLen > 1e-8 && segLen <= _MaxSegLength)
+                else
                 {
-                    found2D = true;
-                    result2D_start = a3d + dir3d * minP;
-                    result2D_end   = a3d + dir3d * maxP;
+                    centB += pts3d[k]; cntB++;
+                }
+            }
+
+            if (cntA > 0 && cntB > 0)
+            {
+                centA /= (float)cntA;
+                centB /= (float)cntB;
+
+                float3 dir3d = centB - centA;
+                float dirLen = length(dir3d);
+
+                if (dirLen > 1e-8)
+                {
+                    dir3d /= dirLen;
+
+                    // Pass 3: Tüm 3D inlier'ları bu yöne projekte et
+                    float minP = 1e10;
+                    float maxP = -1e10;
+
+                    for (int k = 0; k < cnt; k++)
+                    {
+                        float2 ap2 = pts2d[k] - bestA2d;
+                        float cv = ap2.x * bestDir2d.y - ap2.y * bestDir2d.x;
+                        if (cv * cv >= 2.25) continue;
+
+                        float3 d = pts3d[k] - centA;
+                        float3 cr = cross(d, dir3d);
+                        if (dot(cr, cr) < thSq3D)
+                        {
+                            float p = dot(d, dir3d);
+                            minP = min(minP, p);
+                            maxP = max(maxP, p);
+                        }
+                    }
+
+                    float segLen = maxP - minP;
+                    if (segLen > 1e-8 && segLen <= _MaxSegLength)
+                    {
+                        found2D = true;
+                        result2D_start = centA + dir3d * minP;
+                        result2D_end   = centA + dir3d * maxP;
+                    }
                 }
             }
         }
