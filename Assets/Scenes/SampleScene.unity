@@ -674,6 +674,7 @@ MonoBehaviour:
   depthSensitivity: 0.1
   maxDepth: 50
   normalSensitivity: 10
+  minCreaseAngleDeg: 26
   invertOutput: 0
 --- !u!114 &963194232
 MonoBehaviour:
@@ -745,6 +746,8 @@ MonoBehaviour:
   showPointCloud: 0
   pointCloudColor: {r: 0, g: 1, b: 0, a: 1}
   pointSize: 0.01
+  showRawEdgePoints: 0
+  rawPointColor: {r: 0, g: 1, b: 1, a: 1}
   showPerformance: 1
   _algorithmMs: 0
   _readbackMs: 0
