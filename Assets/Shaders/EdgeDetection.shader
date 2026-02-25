@@ -31,11 +31,16 @@ Shader "Custom/EdgeDetection"
         _ColorWeight ("Color Weight", Range(0, 1)) = 0.3
         
         [Toggle] _InvertOutput ("Invert Output", Float) = 0
-        
+
         // YENİ: Thinning için magnitude output modu
         // 1 = magnitude değerini doğrudan çıkar (thinning pass için)
         // 0 = binary threshold uygula (final output için)
         [Toggle] _OutputMagnitude ("Output Raw Magnitude", Float) = 0
+
+        // Crease filtresi: Bu değerin ÜSTÜNDE dot product → açı çok küçük → smooth yüzey → edge sayma
+        // Örnek: 0.94 ≈ cos(20°), 0.87 ≈ cos(30°), 0.71 ≈ cos(45°)
+        // Sphere/capsule mesh edge'leri (~10-20°) bastırmak için: 0.90-0.95
+        _MinCreaseDot ("Min Crease Dot (smooth=1, sharp=0)", Range(0, 1)) = 0.9
     }
     
     SubShader
@@ -83,6 +88,7 @@ Shader "Custom/EdgeDetection"
             float _ColorWeight;
             float _InvertOutput;
             float _OutputMagnitude;  // YENİ
+            float _MinCreaseDot;     // Crease filtresi: bu dot değerinden BÜYÜK açılar edge sayılmaz
             
             v2f vert (appdata v)
             {
@@ -216,7 +222,6 @@ Shader "Custom/EdgeDetection"
                     edge += de * _DepthSensitivity * _DepthWeight;
                 }
                 
-                // EdgeDetection.shader - Satır ~46 civarı
                 // NORMAL KENARLARI
                 if (_NormalWeight > 0.01)
                 {
@@ -225,15 +230,22 @@ Shader "Custom/EdgeDetection"
                     float3 nb = SampleNormal(uv + float2(0, -t.y));
                     float3 nl = SampleNormal(uv + float2(-t.x, 0));
                     float3 nr = SampleNormal(uv + float2(t.x, 0));
-                    
+
+                    // Her komşu için dot product (1 = aynı yön, 0 = dik, -1 = zıt)
+                    float dotT = saturate(dot(nc, nt));
+                    float dotB = saturate(dot(nc, nb));
+                    float dotL = saturate(dot(nc, nl));
+                    float dotR = saturate(dot(nc, nr));
+
                     float ne = 0;
-                    // YENİ MATEMATİK: 'pow' ekleyerek kontrastı artırıyoruz.
-                    // Zayıf kenarlar (yüzey eğimi) sıfıra yaklaşır, sert kenarlar 1 kalır.
-                    ne += pow(1.0 - saturate(dot(nc, nt)), 2); 
-                    ne += pow(1.0 - saturate(dot(nc, nb)), 2);
-                    ne += pow(1.0 - saturate(dot(nc, nl)), 2);
-                    ne += pow(1.0 - saturate(dot(nc, nr)), 2);
-                    
+                    // CREASE FİLTRESİ: Yalnızca açı _MinCreaseDot eşiğini GEÇEN kenarlara bak.
+                    // dot > _MinCreaseDot → açı çok küçük → smooth yüzey (sphere/capsule mesh edge) → atla.
+                    // dot < _MinCreaseDot → açı büyük → gerçek crease (kutu köşesi vb.) → ekle.
+                    if (dotT < _MinCreaseDot) ne += pow(1.0 - dotT, 2);
+                    if (dotB < _MinCreaseDot) ne += pow(1.0 - dotB, 2);
+                    if (dotL < _MinCreaseDot) ne += pow(1.0 - dotL, 2);
+                    if (dotR < _MinCreaseDot) ne += pow(1.0 - dotR, 2);
+
                     edge += ne * _NormalSensitivity * _NormalWeight;
                 }
                 

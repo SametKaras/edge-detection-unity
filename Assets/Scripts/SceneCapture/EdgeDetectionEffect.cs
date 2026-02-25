@@ -29,6 +29,12 @@ namespace SceneCapture
         public float maxDepth = 50f;
         [Range(0.1f, 100f)] public float normalSensitivity = 1f;
 
+        [Header("Crease Angle Filter (Combined / Normal mode)")]
+        [Tooltip("Yalnızca bu açıdan BÜYÜK normal farkları crease edge sayılır.\n" +
+                 "Sphere / capsule mesh edge'lerini bastırmak için 20-30° önerilir.\n" +
+                 "0° = tüm normal farkları edge, 90° = yalnızca dik köşeler edge.")]
+        [Range(0f, 90f)] public float minCreaseAngleDeg = 26f;
+
         public bool invertOutput = false;
         
         public enum EdgeMethod { Sobel, Roberts, Prewitt }
@@ -75,6 +81,8 @@ namespace SceneCapture
             _material.SetFloat("_DepthWeight", depthWeight);
             _material.SetFloat("_NormalWeight", normalWeight);
             _material.SetFloat("_ColorWeight", colorWeight);
+            // Crease filtresi: derece → cos(açı) dönüşümü (shader dot product ile karşılaştırır)
+            _material.SetFloat("_MinCreaseDot", Mathf.Cos(minCreaseAngleDeg * Mathf.Deg2Rad));
             
             foreach (var kw in MethodKeywords) _material.DisableKeyword(kw);
             _material.EnableKeyword(MethodKeywords[(int)method]);
