@@ -53,6 +53,11 @@ namespace SceneCapture.Edge3D
         public Color pointCloudColor = Color.green;
         [Range(0.001f, 0.1f)] public float pointSize = 0.01f;
 
+        [Header("Debug: Raw Edge Points")]
+        [Tooltip("Edge piksellerinin ham 3D pozisyonlarını gösterir (RANSAC öncesi)")]
+        public bool showRawEdgePoints = false;
+        public Color rawPointColor = Color.cyan;
+
         [Header("Performance (Read-Only)")]
         public bool showPerformance = true;
         [SerializeField] private float _algorithmMs;
@@ -68,9 +73,13 @@ namespace SceneCapture.Edge3D
 
         private ComputeBuffer _lineBuffer;
         private ComputeBuffer _countBuffer;
+        private ComputeBuffer _debugBuffer;
+        private ComputeBuffer _debugCountBuffer;
 
         private MicroLine[] _displayLines;
         private int _displayLineCount;
+        private MicroLine[] _debugPoints;
+        private int _debugPointCount;
         private bool _hasNewData = false;
         private float _lastUpdateTime = -999f;
 
@@ -106,7 +115,10 @@ namespace SceneCapture.Edge3D
 
             _lineBuffer = new ComputeBuffer(MAX_LINES, STRIDE, ComputeBufferType.Append);
             _countBuffer = new ComputeBuffer(1, sizeof(uint) * 3, ComputeBufferType.IndirectArguments);
+            _debugBuffer = new ComputeBuffer(MAX_LINES, STRIDE, ComputeBufferType.Append);
+            _debugCountBuffer = new ComputeBuffer(1, sizeof(uint) * 3, ComputeBufferType.IndirectArguments);
             _displayLines = new MicroLine[MAX_LINES];
+            _debugPoints = new MicroLine[MAX_LINES];
 
             _sw.Start();
         }
@@ -146,6 +158,7 @@ namespace SceneCapture.Edge3D
             _posCam.RenderWithShader(worldPosShader, "RenderType");
 
             // Compute shader dispatch
+            if (_lineBuffer == null || _edgeEffect.EdgeResultTexture == null) return;
             _lineBuffer.SetCounterValue(0);
             int kernel = microLineCS.FindKernel("FitMicroLines");
 
@@ -161,6 +174,14 @@ namespace SceneCapture.Edge3D
             microLineCS.SetInt("_TexHeight", Screen.height);
             microLineCS.SetBuffer(kernel, "_OutputLines", _lineBuffer);
             microLineCS.SetInt("_FrameSeed", Time.frameCount);
+
+            // Debug mode
+            if (_debugBuffer != null)
+            {
+                _debugBuffer.SetCounterValue(0);
+                microLineCS.SetBuffer(kernel, "_DebugPoints", _debugBuffer);
+            }
+            microLineCS.SetInt("_DebugMode", showRawEdgePoints ? 1 : 0);
 
             int tilesX = Mathf.CeilToInt((float)Screen.width / k);
             int tilesY = Mathf.CeilToInt((float)Screen.height / k);
@@ -179,6 +200,23 @@ namespace SceneCapture.Edge3D
             ComputeBuffer.CopyCount(_lineBuffer, _countBuffer, 0);
             _countReq = AsyncGPUReadback.Request(_countBuffer);
             _rbState = ReadbackState.WaitingCount;
+
+            // Debug noktaları için sünkron readback (debug modda)
+            if (showRawEdgePoints && _debugBuffer != null)
+            {
+                ComputeBuffer.CopyCount(_debugBuffer, _debugCountBuffer, 0);
+                int[] debugCount = new int[3];
+                _debugCountBuffer.GetData(debugCount);
+                _debugPointCount = Mathf.Min(debugCount[0], MAX_LINES);
+                if (_debugPointCount > 0)
+                {
+                    _debugBuffer.GetData(_debugPoints, 0, 0, _debugPointCount);
+                }
+            }
+            else
+            {
+                _debugPointCount = 0;
+            }
         }
 
         void PollReadback()
@@ -268,6 +306,17 @@ namespace SceneCapture.Edge3D
                         (l.sz + l.ez) * 0.5f), pointSize);
                 }
             }
+
+            // Raw edge pixel pozisyonları (debug)
+            if (showRawEdgePoints && _debugPoints != null)
+            {
+                Gizmos.color = rawPointColor;
+                for (int i = 0; i < _debugPointCount; i++)
+                {
+                    var p = _debugPoints[i];
+                    Gizmos.DrawSphere(new Vector3(p.sx, p.sy, p.sz), pointSize);
+                }
+            }
         }
 
         void OnGUI()
@@ -298,6 +347,8 @@ namespace SceneCapture.Edge3D
         {
             if (_lineBuffer != null) { _lineBuffer.Release(); _lineBuffer = null; }
             if (_countBuffer != null) { _countBuffer.Release(); _countBuffer = null; }
+            if (_debugBuffer != null) { _debugBuffer.Release(); _debugBuffer = null; }
+            if (_debugCountBuffer != null) { _debugCountBuffer.Release(); _debugCountBuffer = null; }
             if (_worldPosRT != null) { _worldPosRT.Release(); _worldPosRT = null; }
         }
     }
