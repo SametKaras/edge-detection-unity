@@ -1,43 +1,35 @@
+// EdgeToMicroLines.compute
+// Direct 3D RANSAC + PCA Refinement
+// 2D RANSAC atlandı — doğrudan 3D pozisyonlarda çizgi bulucu
+// Silhouette edge'lerde offset ile tutarlı depth, crease edge'lerde orijinal WorldPos
+
 #pragma kernel FitMicroLines
 
-// ==================== SABİTLER ====================
-#define MAX_PTS 81   // Bir kernel içinde toplanabilecek max edge nokta sayısı (9×9)
-#define OFFSET  5    // Silhouette kenarları için piksel offset miktarı
+#define MAX_PTS 81   // 9×9 = max 81 nokta
+#define OFFSET  5    // Silhouette için piksel offset
 
-// ==================== GİRİŞ TEXTURE'LARI ====================
-// _EdgeTex: Edge detection sonucu. Beyaz (>threshold) = kenar pikseli.
-// _WorldPosTex: Her pikselin 3D dünya koordinatı (128-bit ARGBFloat).
-//               RGB = XYZ dünya pozisyonu, A = 1.0 (dolu) veya 0.0 (boş/arkaplan)
 Texture2D<float4> _EdgeTex;
 Texture2D<float4> _WorldPosTex;
 
-// ==================== ÇIKIŞ YAPISINI ====================
-// Her MicroLine, bir 3D çizgi segmentini temsil eder:
-// (sx,sy,sz) = başlangıç noktası, (ex,ey,ez) = bitiş noktası
 struct MicroLine
 {
-    float sx, sy, sz;   // Segment başlangıcı (dünya koordinatları)
-    float ex, ey, ez;   // Segment bitişi (dünya koordinatları)
+    float sx, sy, sz;
+    float ex, ey, ez;
 };
 
-// AppendBuffer: GPU paralel olarak çizgi ekler, sıra önemsiz
 AppendStructuredBuffer<MicroLine> _OutputLines;
+AppendStructuredBuffer<MicroLine> _DebugPoints;
 
-// ==================== PARAMETRELER (C# tarafından ayarlanır) ====================
-int   _KernelSize;          // Kernel boyutu (3, 5, 7 veya 9) - piksel
-float _MinEdgeThreshold;    // Edge algılama eşiği - bu değerin üstü = kenar pikseli
-int   _MinPointsForLine;    // Çizgi kabul etmek için gereken minimum inlier sayısı
-float _InlierThreshold;     // 3D RANSAC inlier mesafe eşiği (dünya birimi)
-float _MaxSegLength;        // Maksimum segment uzunluğu (dünya birimi)
-int   _TexWidth;            // Ekran genişliği (piksel)
-int   _TexHeight;           // Ekran yüksekliği (piksel)
-uint  _FrameSeed;           // Her frame farklı rastgele sonuçlar için seed
+int   _KernelSize;
+float _MinEdgeThreshold;
+int   _MinPointsForLine;
+float _InlierThreshold;
+float _MaxSegLength;
+int   _TexWidth;
+int   _TexHeight;
+uint  _FrameSeed;
+int   _DebugMode;
 
-// ==================== YARDIMCI FONKSİYONLAR ====================
-
-// Wang Hash: Hızlı tam sayı hash fonksiyonu.
-// RANSAC'ta rastgele nokta çiftleri seçmek için kullanılır.
-// Her çağrıda seed değişir → sözde rastgele sayı dizisi üretir.
 uint WangHash(uint seed)
 {
     seed = (seed ^ 61u) ^ (seed >> 16u);
@@ -48,498 +40,248 @@ uint WangHash(uint seed)
     return seed;
 }
 
-// Sobel Gradyan Hesaplama:
-// Bir edge pikselinin yakın komşularına bakarak gradyan yönünü hesaplar.
-// Gradyan yönü, kenar çizgisine DİK olan yöndür.
-// Bu bilgi, silhouette/crease ayrımı ve offset yönü için kullanılır.
-//
-// Sobel 3×3 çekirdeği:
-//   Gx: [-1 0 +1]    Gy: [-1 -2 -1]
-//       [-2 0 +2]        [ 0  0  0]
-//       [-1 0 +1]        [+1 +2 +1]
+// Edge pikselindeki Sobel gradyanı (kenara dik yön)
 float2 ComputeEdgeGradient(int px, int py)
 {
-    // 3×3 komşuluk değerlerini oku (sınır kontrolü ile)
-    float tl = _EdgeTex[uint2(max(px-1,0),          max(py-1,0))].r;          // Sol üst
-    float tc = _EdgeTex[uint2(px,                    max(py-1,0))].r;          // Üst orta
-    float tr = _EdgeTex[uint2(min(px+1,_TexWidth-1), max(py-1,0))].r;          // Sağ üst
-    float ml = _EdgeTex[uint2(max(px-1,0),           py)].r;                   // Sol orta
-    float mr = _EdgeTex[uint2(min(px+1,_TexWidth-1), py)].r;                   // Sağ orta
-    float bl = _EdgeTex[uint2(max(px-1,0),           min(py+1,_TexHeight-1))].r; // Sol alt
-    float bc = _EdgeTex[uint2(px,                    min(py+1,_TexHeight-1))].r; // Alt orta
-    float br = _EdgeTex[uint2(min(px+1,_TexWidth-1), min(py+1,_TexHeight-1))].r; // Sağ alt
+    float tl = _EdgeTex[uint2(max(px-1,0),          max(py-1,0))].r;
+    float tc = _EdgeTex[uint2(px,                    max(py-1,0))].r;
+    float tr = _EdgeTex[uint2(min(px+1,_TexWidth-1), max(py-1,0))].r;
+    float ml = _EdgeTex[uint2(max(px-1,0),           py)].r;
+    float mr = _EdgeTex[uint2(min(px+1,_TexWidth-1), py)].r;
+    float bl = _EdgeTex[uint2(max(px-1,0),           min(py+1,_TexHeight-1))].r;
+    float bc = _EdgeTex[uint2(px,                    min(py+1,_TexHeight-1))].r;
+    float br = _EdgeTex[uint2(min(px+1,_TexWidth-1), min(py+1,_TexHeight-1))].r;
 
-    // Yatay gradyan (Gx) ve dikey gradyan (Gy)
-    float gx = (tr + 2*mr + br) - (tl + 2*ml + bl);
-    float gy = (bl + 2*bc + br) - (tl + 2*tc + tr);
-
+    float gx = -tl + tr - 2*ml + 2*mr - bl + br;
+    float gy = -tl - 2*tc - tr + bl + 2*bc + br;
     return float2(gx, gy);
 }
 
-// ==================== ANA KERNEL ====================
-// Her thread bir kernel tile'ını işler.
-// 8×8 thread grubu = 64 tile paralel işlenir.
 [numthreads(8, 8, 1)]
 void FitMicroLines(uint3 id : SV_DispatchThreadID)
 {
-    // Bu thread'in işleyeceği kernel tile'ının piksel sınırları
-    int startX = id.x * _KernelSize;
-    int startY = id.y * _KernelSize;
-
-    // Ekran dışındaki tile'ları atla
+    int k = _KernelSize;
+    int startX = id.x * k;
+    int startY = id.y * k;
+    int endX = min(startX + k, _TexWidth);
+    int endY = min(startY + k, _TexHeight);
     if (startX >= _TexWidth || startY >= _TexHeight) return;
 
-    // Tile sınırlarını ekran boyutuna kırp
-    int endX = min(startX + _KernelSize, _TexWidth);
-    int endY = min(startY + _KernelSize, _TexHeight);
+    // Kernel merkezini al
+    int cx = (startX + endX) / 2;
+    int cy = (startY + endY) / 2;
 
-    // =========================================================
-    // ADIM 0: EDGE TİPİNİ BELİRLE
-    // =========================================================
-    // Kernel içindeki tüm edge piksellerin gradyanlarını topla.
-    // Ortalama gradyan, kenarın genel yönünü verir.
-    float2 avgGrad = float2(0, 0);   // Toplam gradyan vektörü
-    int edgeCount = 0;               // Bu tile'daki edge piksel sayısı
+    // ===== SILHOUETTE TESPİTİ =====
+    bool isSilhouette = false;
+    float2 silhouetteDir = float2(0, 0);
 
-    for (int ay = startY; ay < endY; ay++)
+    float centerEdge = _EdgeTex[uint2(cx, cy)].r;
+    if (centerEdge > _MinEdgeThreshold)
     {
-        for (int ax = startX; ax < endX; ax++)
+        float2 grad = ComputeEdgeGradient(cx, cy);
+        float gradLen = length(grad);
+        if (gradLen > 0.001)
         {
-            // Edge texture'dan pikselin kenar olup olmadığını kontrol et
-            if (_EdgeTex[uint2(ax, ay)].r > _MinEdgeThreshold)
+            float2 perpDir = normalize(grad);
+
+            int ox1 = clamp(cx + (int)(perpDir.x * OFFSET), 0, _TexWidth  - 1);
+            int oy1 = clamp(cy + (int)(perpDir.y * OFFSET), 0, _TexHeight - 1);
+            int ox2 = clamp(cx - (int)(perpDir.x * OFFSET), 0, _TexWidth  - 1);
+            int oy2 = clamp(cy - (int)(perpDir.y * OFFSET), 0, _TexHeight - 1);
+
+            bool v1 = (_WorldPosTex[uint2(ox1, oy1)].w > 0);
+            bool v2 = (_WorldPosTex[uint2(ox2, oy2)].w > 0);
+
+            if (v1 && !v2)
             {
-                // Bu pikselin Sobel gradyanını hesapla ve toplama ekle
-                avgGrad += ComputeEdgeGradient(ax, ay);
-                edgeCount++;
+                isSilhouette = true;
+                silhouetteDir = perpDir;
+            }
+            else if (!v1 && v2)
+            {
+                isSilhouette = true;
+                silhouetteDir = -perpDir;
             }
         }
     }
 
-    // Yeterli edge pikseli yoksa bu tile'ı atla (çizgi çıkartılamaz)
-    if (edgeCount < _MinPointsForLine) return;
-
-    // ----- Edge tipi sınıflandırması -----
-    // Silhouette: Kenarın bir tarafı nesne, diğer tarafı boşluk (arkaplan)
-    // Crease: Kenarın her iki tarafı da nesne (iki yüzey buluşuyor)
-    // Diğer: Gradyan çok zayıf (edge tipi belirlenemiyor)
-    bool isSilhouette = false;
-    bool isCrease = false;
-    float2 offsetDir = float2(0, 0);  // WorldPos okumada kullanılacak offset yönü
-
-    float glen = length(avgGrad);
-    if (glen > 1e-4)  // Anlamlı bir gradyan var mı?
-    {
-        // Normalize gradyan = kenara dik yön (edge'den "dışarı" bakış)
-        float2 perpDir = avgGrad / glen;
-
-        // Kernel merkezinin koordinatları
-        int cx = (startX + endX) / 2;
-        int cy = (startY + endY) / 2;
-
-        // Gradyan yönünde (+perpDir) ve tersinde (-perpDir) OFFSET kadar uzağı örnekle
-        // Bu noktaların WorldPos'u var mı yok mu → silhouette/crease ayrımı
-        int ox1 = clamp(cx + (int)(perpDir.x * OFFSET), 0, _TexWidth  - 1);
-        int oy1 = clamp(cy + (int)(perpDir.y * OFFSET), 0, _TexHeight - 1);
-        int ox2 = clamp(cx - (int)(perpDir.x * OFFSET), 0, _TexWidth  - 1);
-        int oy2 = clamp(cy - (int)(perpDir.y * OFFSET), 0, _TexHeight - 1);
-
-        // Alpha > 0 → bu pikselde bir nesne var (geçerli dünya pozisyonu)
-        bool v1 = (_WorldPosTex[uint2(ox1, oy1)].w > 0);
-        bool v2 = (_WorldPosTex[uint2(ox2, oy2)].w > 0);
-
-        if (v1 && !v2)
-        {
-            // +perpDir tarafında nesne var, -perpDir tarafında yok → SİLHOUETTE
-            // Offset yönü: nesnenin olduğu tarafa (perpDir)
-            isSilhouette = true;
-            offsetDir = perpDir;
-        }
-        else if (!v1 && v2)
-        {
-            // Tersi: -perpDir tarafında nesne var → offset o yöne
-            isSilhouette = true;
-            offsetDir = -perpDir;
-        }
-        else if (v1 && v2)
-        {
-            // Her iki tarafta da nesne var → CREASE (iki yüzey buluşuyor)
-            // Hangi tarafın depth'i daha stabil? (kameraya daha dik yüzey = daha stabil)
-            // İki farklı mesafede örnekleyip depth değişim hızını karşılaştır
-
-            // +perpDir tarafı: OFFSET ve OFFSET+3 mesafelerinde iki nokta
-            float3 wp1a = _WorldPosTex[uint2(ox1, oy1)].xyz;
-            int ox1b = clamp(cx + (int)(perpDir.x * (OFFSET + 3)), 0, _TexWidth  - 1);
-            int oy1b = clamp(cy + (int)(perpDir.y * (OFFSET + 3)), 0, _TexHeight - 1);
-            float3 wp1b = _WorldPosTex[uint2(ox1b, oy1b)].xyz;
-
-            // -perpDir tarafı: aynı şekilde iki nokta
-            float3 wp2a = _WorldPosTex[uint2(ox2, oy2)].xyz;
-            int ox2b = clamp(cx - (int)(perpDir.x * (OFFSET + 3)), 0, _TexWidth  - 1);
-            int oy2b = clamp(cy - (int)(perpDir.y * (OFFSET + 3)), 0, _TexHeight - 1);
-            float3 wp2b = _WorldPosTex[uint2(ox2b, oy2b)].xyz;
-
-            // İki nokta arasındaki 3D mesafe = depth değişim hızı
-            // Küçük değişim = stabil yüzey (kameraya daha dik bakıyor)
-            // Büyük değişim = dik yüzey (kameraya neredeyse paralel, depth hızlı değişiyor)
-            float var1 = dot(wp1b - wp1a, wp1b - wp1a);  // +perpDir tarafı varyansı
-            float var2 = dot(wp2b - wp2a, wp2b - wp2a);  // -perpDir tarafı varyansı
-
-            isCrease = true;
-            // Daha düşük varyansa sahip yöne offset yap (stabil yüzey)
-            offsetDir = (var1 < var2) ? perpDir : -perpDir;
-        }
-    }
-
-    // =========================================================
-    // ADIM 1: EDGE NOKTALARINI TOPLA (2D + 3D)
-    // =========================================================
-    // Her edge pikseli için hem 2D ekran pozisyonunu hem de
-    // 3D dünya pozisyonunu topla. 2D RANSAC için pts2d, endpoint
-    // hesaplama için pts3d kullanılacak.
-    float2 pts2d[MAX_PTS];   // 2D ekran koordinatları (piksel)
-    float3 pts3d[MAX_PTS];   // 3D dünya koordinatları (metre)
-    int cnt = 0;             // Toplanan geçerli nokta sayısı
+    // ===== 1. EDGE NOKTALARINI TOPLA (3D) =====
+    float3 pts3d[MAX_PTS];
+    int cnt = 0;
 
     for (int py = startY; py < endY; py++)
     {
         for (int px = startX; px < endX; px++)
         {
-            // Edge olmayan pikselleri atla
             if (_EdgeTex[uint2(px, py)].r <= _MinEdgeThreshold) continue;
 
-            float4 wp;  // Bu pikselin dünya pozisyonu
-
+            float4 wp;
             if (isSilhouette)
             {
-                // SİLHOUETTE: Kenar pikselinin kendisi "grazing angle"da
-                // (yüzeye neredeyse paralel bakış) olduğu için depth çok gürültülü.
-                // Çözüm: 5 piksel nesne yönüne kaydırarak oku → tutarlı depth
-                int ox = clamp(px + (int)(offsetDir.x * OFFSET), 0, _TexWidth  - 1);
-                int oy = clamp(py + (int)(offsetDir.y * OFFSET), 0, _TexHeight - 1);
-                wp = _WorldPosTex[uint2(ox, oy)];
-            }
-            else if (isCrease)
-            {
-                // CREASE: Kenar pikseli iki yüzeyin kesişiminde.
-                // WorldPos rastgele Surface A veya Surface B'den geliyor.
-                // Çözüm: 2 piksel stabil yüzeye doğru kaydır → tutarlı tek yüzey verisi
-                int ox = clamp(px + (int)(offsetDir.x * 2), 0, _TexWidth  - 1);
-                int oy = clamp(py + (int)(offsetDir.y * 2), 0, _TexHeight - 1);
+                int ox = clamp(px + (int)(silhouetteDir.x * OFFSET), 0, _TexWidth  - 1);
+                int oy = clamp(py + (int)(silhouetteDir.y * OFFSET), 0, _TexHeight - 1);
                 wp = _WorldPosTex[uint2(ox, oy)];
             }
             else
             {
-                // DİĞER: Gradyan belirsiz → orijinal piksel pozisyonunu kullan
                 wp = _WorldPosTex[uint2(px, py)];
             }
 
-            // Alpha = 0 → bu pikselde nesne yok (arkaplan), atla
             if (wp.w <= 0) continue;
 
-            // 2D ve 3D pozisyonları dizilere kaydet
-            pts2d[cnt] = float2(px, py);    // Ekran koordinatı
-            pts3d[cnt] = wp.xyz;            // Dünya koordinatı
+            pts3d[cnt] = wp.xyz;
             cnt++;
-
-            // Dizi taşmasını önle
             if (cnt >= MAX_PTS) break;
         }
         if (cnt >= MAX_PTS) break;
     }
 
-    // Yeterli nokta yoksa çizgi çıkartılamaz, atla
     if (cnt < _MinPointsForLine) return;
 
-    // Sık kullanılan eşik değerlerinin kareleri (sqrt hesaplamaktan kaçınmak için)
-    float thSq3D = _InlierThreshold * _InlierThreshold;   // 3D inlier eşik²
-    float segSq  = _MaxSegLength * _MaxSegLength;          // Max segment uzunluk²
+    // Debug mode: raw edge piksel pozisyonlarını çıkar
+    if (_DebugMode > 0)
+    {
+        for (int di = 0; di < cnt; di++)
+        {
+            MicroLine pt;
+            pt.sx = pts3d[di].x; pt.sy = pts3d[di].y; pt.sz = pts3d[di].z;
+            pt.ex = pts3d[di].x; pt.ey = pts3d[di].y; pt.ez = pts3d[di].z;
+            _DebugPoints.Append(pt);
+        }
+        return;
+    }
 
-    // Rastgele sayı üreteci seed'i (her tile ve frame için benzersiz)
+    // =========================================================
+    // DIRECT 3D RANSAC: Doğrudan 3D pozisyonlarda çizgi bul
+    // =========================================================
+    
+    float thSq3D = _InlierThreshold * _InlierThreshold;
+    float segSq  = _MaxSegLength * _MaxSegLength;
+    
     uint seed = WangHash(id.x + id.y * 65537u + _FrameSeed * 7919u + 1u);
-
-    // =========================================================
-    // AŞAMA A: 2D RANSAC DENEMESİ (daha iyi kalite)
-    // =========================================================
-    // Önce 2D piksel uzayında çizgi yönünü bulmaya çalış.
-    // Piksel uzayında kenar pikselleri düz bir çizgi üzerinde dizilir,
-    // bu nedenle 2D RANSAC daha temiz bir yön verir.
-    // Eğer başarılı olursa, 3D endpoint'leri centroid tabanlı hesapla.
-    bool found2D = false;
-    float3 result2D_start = float3(0,0,0);
-    float3 result2D_end   = float3(0,0,0);
+    
+    int bestCount = 0;
+    int bestI1 = 0;
+    int bestI2 = 0;
+    
+    int maxIter = min(60, (int)((uint)cnt * ((uint)cnt - 1u) / 2u));
+    
+    for (int it = 0; it < maxIter; it++)
     {
-        float thSq2D = 2.25;  // 2D inlier eşiği: 1.5 piksel (1.5² = 2.25)
-        int bestCount2D = 0;   // En iyi modelin inlier sayısı
-        int bestI1 = 0;        // En iyi aday çiftin ilk noktasının indeksi
-        int bestI2 = 0;        // En iyi aday çiftin ikinci noktasının indeksi
-        float2 bestA2d = float2(0, 0);    // En iyi modelin 2D referans noktası
-        float2 bestDir2d = float2(0, 0);  // En iyi modelin 2D yön vektörü
-
-        // RANSAC seed'i (2D için ayrı, 3D'yi etkilemesin)
-        uint seed2d = seed;
-
-        // İterasyon sayısı: max 30 veya tüm olası çiftler (hangisi küçükse)
-        int maxIter = min(30, (int)((uint)cnt * ((uint)cnt - 1u) / 2u));
-
-        for (int it = 0; it < maxIter; it++)
-        {
-            // Rastgele iki farklı nokta seç (aday çift)
-            seed2d = WangHash(seed2d);
-            int i1 = seed2d % (uint)cnt;
-            seed2d = WangHash(seed2d);
-            int i2 = seed2d % (uint)cnt;
-            if (i2 == i1) continue;  // Aynı noktayı iki kez seçemeyiz
-
-            // 2D aday çiftin piksel pozisyonları ve aralarındaki vektör
-            float2 a = pts2d[i1];
-            float2 b = pts2d[i2];
-            float2 ab = b - a;
-            float abLenSq = dot(ab, ab);
-
-            // Çok yakın noktalar anlamlı bir yön vermez, atla
-            if (abLenSq < 1.0) continue;
-
-            // 3D MESAFE KONTROLÜ: Aday çiftin 3D dünyada birbirine yakın
-            // olduğunu doğrula. Farklı nesnelerden gelen noktaların
-            // eşleşmesini önler (uzak noktalar = farklı yüzey/nesne)
-            float3 ab3d = pts3d[i2] - pts3d[i1];
-            if (dot(ab3d, ab3d) > segSq) continue;
-
-            // 2D çizgi yön vektörünü normalize et
-            float2 dir = ab / sqrt(abLenSq);
-
-            // Bu model için kaç nokta inlier? (çizgiye yakın mı?)
-            int inl = 0;
-            for (int k = 0; k < cnt; k++)
-            {
-                // Noktanın 2D çizgiye dik mesafesi (çapraz çarpım ile)
-                float2 ap = pts2d[k] - a;
-                float crossVal = ap.x * dir.y - ap.y * dir.x;
-
-                // Mesafe² < eşik² → inlier (çizgiye yeterince yakın)
-                if (crossVal * crossVal < thSq2D) inl++;
-            }
-
-            // Bu model önceki en iyiden daha çok inlier buldu mu?
-            if (inl > bestCount2D)
-            {
-                bestCount2D = inl;
-                bestI1 = i1;
-                bestI2 = i2;
-                bestA2d = a;
-                bestDir2d = dir;
-            }
-        }
-
-        // 2D RANSAC yeterli inlier bulduysa → 3D endpoint hesapla
-        if (bestCount2D >= _MinPointsForLine)
-        {
-            // ===== CENTROID TABANLI 3D YÖN HESAPLAMA =====
-            // Problem: Aday çiftin 2 noktası farklı yüzeylerden gelebilir
-            //          → 3D yönü yanlış olur.
-            // Çözüm: İnlier'ları 2D çizgi üzerinde ikiye böl.
-            //         Her yarının 3D centroid'ini (ağırlık merkezi) hesapla.
-            //         İki centroid arasındaki yön = çok daha sağlam 3D yön.
-            //         Centroid birden fazla noktanın ortalamasıdır → gürültü azalır.
-
-            // Pass 1: İnlier'ların 2D çizgi üzerindeki projeksiyonlarının
-            //         min ve max değerini bul (çizginin uçları)
-            float minP2d =  1e10;
-            float maxP2d = -1e10;
-
-            for (int k = 0; k < cnt; k++)
-            {
-                float2 ap2 = pts2d[k] - bestA2d;
-                // 2D çizgiye dik mesafe (inlier kontrolü)
-                float cv = ap2.x * bestDir2d.y - ap2.y * bestDir2d.x;
-                if (cv * cv >= 2.25) continue;  // İnlier değil, atla
-
-                // İnlier'ın çizgi üzerindeki pozisyonu (projeksiyon)
-                float p = dot(ap2, bestDir2d);
-                minP2d = min(minP2d, p);
-                maxP2d = max(maxP2d, p);
-            }
-
-            // Çizginin ortası (inlier'ları ikiye bölmek için)
-            float midP2d = (minP2d + maxP2d) * 0.5;
-
-            // Pass 2: İnlier'ları ikiye böl ve her yarının 3D centroid'ini hesapla
-            float3 centA = float3(0,0,0);  // İlk yarının centroid'i
-            float3 centB = float3(0,0,0);  // İkinci yarının centroid'i
-            int cntA = 0, cntB = 0;        // Her yarıdaki nokta sayısı
-
-            for (int k = 0; k < cnt; k++)
-            {
-                float2 ap2 = pts2d[k] - bestA2d;
-                float cv = ap2.x * bestDir2d.y - ap2.y * bestDir2d.x;
-                if (cv * cv >= 2.25) continue;
-
-                float p = dot(ap2, bestDir2d);
-                if (p < midP2d)
-                {
-                    // Çizginin ilk yarısındaki noktalar
-                    centA += pts3d[k]; cntA++;
-                }
-                else
-                {
-                    // Çizginin ikinci yarısındaki noktalar
-                    centB += pts3d[k]; cntB++;
-                }
-            }
-
-            // Her iki yarıda da en az bir nokta olmalı
-            if (cntA > 0 && cntB > 0)
-            {
-                // Centroid = toplam / sayı (ortalaması)
-                centA /= (float)cntA;
-                centB /= (float)cntB;
-
-                // 3D çizgi yönü: iki centroid arasındaki vektör
-                float3 dir3d = centB - centA;
-                float dirLen = length(dir3d);
-
-                if (dirLen > 1e-8)
-                {
-                    dir3d /= dirLen;   // Normalize et
-
-                    // Pass 3: Tüm 2D+3D inlier noktaları bu 3D yöne projekte et
-                    // En uzak iki projeksiyon → segment başlangıç ve bitiş noktaları
-                    float minP = 1e10;
-                    float maxP = -1e10;
-
-                    for (int k = 0; k < cnt; k++)
-                    {
-                        // Önce 2D inlier kontrolü
-                        float2 ap2 = pts2d[k] - bestA2d;
-                        float cv = ap2.x * bestDir2d.y - ap2.y * bestDir2d.x;
-                        if (cv * cv >= 2.25) continue;
-
-                        // Sonra 3D inlier kontrolü (çizgiye 3D mesafe)
-                        float3 d = pts3d[k] - centA;
-                        float3 cr = cross(d, dir3d);
-                        if (dot(cr, cr) < thSq3D)
-                        {
-                            // Bu nokta hem 2D hem 3D'de çizgiye yakın → geçerli inlier
-                            float p = dot(d, dir3d);   // Çizgi üzerindeki pozisyon
-                            minP = min(minP, p);       // En gerideki nokta
-                            maxP = max(maxP, p);       // En öndeki nokta
-                        }
-                    }
-
-                    // Segment uzunluğu kontrolü
-                    float segLen = maxP - minP;
-                    if (segLen > 1e-8 && segLen <= _MaxSegLength)
-                    {
-                        found2D = true;
-                        // 3D başlangıç ve bitiş noktaları
-                        result2D_start = centA + dir3d * minP;
-                        result2D_end   = centA + dir3d * maxP;
-                    }
-                }
-            }
-        }
-    }
-
-    // 2D RANSAC başarılıysa → sonucu yaz ve bitir
-    if (found2D)
-    {
-        MicroLine ml;
-        ml.sx = result2D_start.x; ml.sy = result2D_start.y; ml.sz = result2D_start.z;
-        ml.ex = result2D_end.x;   ml.ey = result2D_end.y;   ml.ez = result2D_end.z;
-        _OutputLines.Append(ml);
-        return;   // Bu tile için işlem bitti
-    }
-
-    // =========================================================
-    // AŞAMA B: 3D RANSAC FALLBACK (güvenilir kapsam)
-    // =========================================================
-    // 2D RANSAC başarısız olduysa (segment çok uzun, aday çiftler uyumsuz vb.)
-    // 3D RANSAC devreye girer. Tamamen dünya koordinatlarında çalışır.
-    // Her zaman sonuç üretebilir → hiçbir kenar kaçırılmaz.
-
-    int bestCount3D = 0;                     // En iyi 3D modelin inlier sayısı
-    float3 bestA = float3(0, 0, 0);          // En iyi aday çiftin ilk noktası
-    float3 bestB = float3(0, 0, 0);          // En iyi aday çiftin ikinci noktası
-
-    // 3D RANSAC iterasyon sayısı
-    int maxIter3D = min(30, (int)((uint)cnt * ((uint)cnt - 1u) / 2u));
-
-    for (int it = 0; it < maxIter3D; it++)
-    {
-        // Rastgele iki farklı nokta seç
         seed = WangHash(seed);
         int i1 = seed % (uint)cnt;
         seed = WangHash(seed);
         int i2 = seed % (uint)cnt;
         if (i2 == i1) continue;
-
+        
         float3 a = pts3d[i1];
         float3 b = pts3d[i2];
-
-        // İki nokta arasındaki 3D vektör ve mesafe²
+        
         float3 ab = b - a;
         float abLenSq = dot(ab, ab);
-
-        // Çok uzak noktalar (farklı nesne?) veya çok yakın noktalar (yön belirsiz?) → atla
         if (abLenSq > segSq || abLenSq < 1e-16) continue;
-
-        // Bu çiftin tanımladığı 3D çizgi yönü
+        
         float3 dir = ab / sqrt(abLenSq);
-
-        // Kaç nokta bu 3D çizgiye yakın? (inlier sayımı)
+        
         int inl = 0;
-        for (int k = 0; k < cnt; k++)
+        for (int ik = 0; ik < cnt; ik++)
         {
-            float3 d = pts3d[k] - a;
-            // Noktanın çizgiye dik mesafesi = |cross(d, dir)|²
+            float3 d = pts3d[ik] - a;
             float3 cr = cross(d, dir);
-            if (dot(cr, cr) < thSq3D) inl++;   // Yeterince yakınsa inlier
+            if (dot(cr, cr) < thSq3D) inl++;
         }
-
-        // Bu model daha iyi mi?
-        if (inl > bestCount3D)
+        
+        if (inl > bestCount)
         {
-            bestCount3D = inl;
-            bestA = a;
-            bestB = b;
+            bestCount = inl;
+            bestI1 = i1;
+            bestI2 = i2;
         }
     }
-
-    // Yeterli inlier yoksa → çizgi yok, atla
-    if (bestCount3D < _MinPointsForLine) return;
-
-    // En iyi 3D çizgi yönünü normalize et
-    float3 bestDir = bestB - bestA;
-    float bdLen = length(bestDir);
-    if (bdLen < 1e-8) return;
-    bestDir /= bdLen;
-
-    // Tüm inlier'ları en iyi yöne projekte ederek segment uçlarını bul
-    float minP = 1e10;
-    float maxP = -1e10;
-
-    for (int k = 0; k < cnt; k++)
+    
+    if (bestCount < _MinPointsForLine) return;
+    
+    // =========================================================
+    // PCA REFINEMENT: RANSAC inlier'ları üzerinde hassas yön
+    // =========================================================
+    
+    float3 bestA = pts3d[bestI1];
+    float3 bestB = pts3d[bestI2];
+    float3 bestDir = normalize(bestB - bestA);
+    
+    // RANSAC inlier'larının 3D ortalaması
+    float3 mean3d = float3(0, 0, 0);
+    int inlierCount = 0;
+    
+    for (int ik = 0; ik < cnt; ik++)
     {
-        float3 d = pts3d[k] - bestA;
+        float3 d = pts3d[ik] - bestA;
         float3 cr = cross(d, bestDir);
-
         if (dot(cr, cr) < thSq3D)
         {
-            // İnlier noktanın çizgi üzerindeki pozisyonu
-            float p = dot(d, bestDir);
-            minP = min(minP, p);   // Segmentin başlangıcı (en gerideki inlier)
-            maxP = max(maxP, p);   // Segmentin bitişi (en öndeki inlier)
+            mean3d += pts3d[ik];
+            inlierCount++;
         }
     }
-
-    // Sıfır uzunluklu segment geçersiz
-    if (maxP - minP < 1e-8) return;
-
-    // 3D segment uç noktaları
-    float3 segStart = bestA + bestDir * minP;
-    float3 segEnd   = bestA + bestDir * maxP;
-
-    // Sonucu AppendBuffer'a yaz → C# tarafında okunacak
+    
+    if (inlierCount < _MinPointsForLine) return;
+    mean3d /= (float)inlierCount;
+    
+    // 3x3 kovaryans matrisi (sadece inlier'lar)
+    float c11 = 0, c12 = 0, c13 = 0;
+    float c22 = 0, c23 = 0, c33 = 0;
+    
+    for (int ik = 0; ik < cnt; ik++)
+    {
+        float3 d = pts3d[ik] - bestA;
+        float3 cr = cross(d, bestDir);
+        if (dot(cr, cr) < thSq3D)
+        {
+            float3 dv = pts3d[ik] - mean3d;
+            c11 += dv.x * dv.x; c12 += dv.x * dv.y; c13 += dv.x * dv.z;
+            c22 += dv.y * dv.y; c23 += dv.y * dv.z;
+            c33 += dv.z * dv.z;
+        }
+    }
+    
+    // Power iteration → hassas 3D çizgi yönü
+    float3 v = bestDir; // RANSAC yönünü başlangıç olarak kullan
+    
+    for (int pi = 0; pi < 8; pi++)
+    {
+        float3 Cv = float3(
+            c11 * v.x + c12 * v.y + c13 * v.z,
+            c12 * v.x + c22 * v.y + c23 * v.z,
+            c13 * v.x + c23 * v.y + c33 * v.z
+        );
+        float cvLen = length(Cv);
+        if (cvLen > 1e-10) v = Cv / cvLen;
+        else break;
+    }
+    
+    // Tüm inlier'ları PCA yönüne projekte et → min/max endpoint
+    float minP = 1e10;
+    float maxP = -1e10;
+    
+    for (int pk = 0; pk < cnt; pk++)
+    {
+        float3 d = pts3d[pk] - bestA;
+        float3 cr = cross(d, bestDir);
+        if (dot(cr, cr) < thSq3D)
+        {
+            float3 dm = pts3d[pk] - mean3d;
+            float p = dot(dm, v);
+            minP = min(minP, p);
+            maxP = max(maxP, p);
+        }
+    }
+    
+    float segLen = maxP - minP;
+    if (segLen < 1e-8 || segLen > _MaxSegLength) return;
+    
+    float3 segStart = mean3d + v * minP;
+    float3 segEnd   = mean3d + v * maxP;
+    
     MicroLine ml;
     ml.sx = segStart.x; ml.sy = segStart.y; ml.sz = segStart.z;
     ml.ex = segEnd.x;   ml.ey = segEnd.y;   ml.ez = segEnd.z;
