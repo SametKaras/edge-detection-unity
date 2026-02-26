@@ -1,15 +1,16 @@
-// EdgeToMicroLines.compute
-// Direct 3D RANSAC + PCA Refinement
-// 2D RANSAC atlandı — doğrudan 3D pozisyonlarda çizgi bulucu
-// Silhouette edge'lerde offset ile tutarlı depth, crease edge'lerde orijinal WorldPos
+// EdgeToMicroLines_Clean.compute
+// Temiz baseline: Build + Fit (RANSAC + PCA)
 
+#pragma kernel BuildEdgePositionBuffer
 #pragma kernel FitMicroLines
 
-#define MAX_PTS 81   // 9×9 = max 81 nokta
-#define OFFSET  5    // Silhouette için piksel offset
+#define MAX_PTS 81
+#define OFFSET  1
 
 Texture2D<float4> _EdgeTex;
 Texture2D<float4> _WorldPosTex;
+Texture2D<float4> _EdgePosTex;
+RWTexture2D<float4> _RWEdgePosTex;
 
 struct MicroLine
 {
@@ -22,7 +23,12 @@ AppendStructuredBuffer<MicroLine> _DebugPoints;
 
 int   _KernelSize;
 float _MinEdgeThreshold;
+float _NmsRelaxation;
+int   _UseGeomDiscontinuityFilter;
+float _MinGeomDiscontinuity;
 int   _MinPointsForLine;
+float _MinInlierRatio;
+float _MinLinearityFactor;
 float _InlierThreshold;
 float _MaxSegLength;
 int   _TexWidth;
@@ -40,21 +46,207 @@ uint WangHash(uint seed)
     return seed;
 }
 
-// Edge pikselindeki Sobel gradyanı (kenara dik yön)
+bool IsValidPos(float4 p)
+{
+    return p.w > 0.5;
+}
+
+float SampleEdge(int x, int y)
+{
+    int cx = clamp(x, 0, _TexWidth - 1);
+    int cy = clamp(y, 0, _TexHeight - 1);
+    return _EdgeTex[uint2(cx, cy)].r;
+}
+
+float SampleEdgeBilinear(float2 p)
+{
+    float2 pp = clamp(p, float2(0, 0), float2(_TexWidth - 1, _TexHeight - 1));
+    int x0 = (int)floor(pp.x);
+    int y0 = (int)floor(pp.y);
+    int x1 = min(x0 + 1, _TexWidth - 1);
+    int y1 = min(y0 + 1, _TexHeight - 1);
+    float fx = pp.x - x0;
+    float fy = pp.y - y0;
+
+    float e00 = _EdgeTex[uint2(x0, y0)].r;
+    float e10 = _EdgeTex[uint2(x1, y0)].r;
+    float e01 = _EdgeTex[uint2(x0, y1)].r;
+    float e11 = _EdgeTex[uint2(x1, y1)].r;
+
+    float e0 = lerp(e00, e10, fx);
+    float e1 = lerp(e01, e11, fx);
+    return lerp(e0, e1, fy);
+}
+
 float2 ComputeEdgeGradient(int px, int py)
 {
-    float tl = _EdgeTex[uint2(max(px-1,0),          max(py-1,0))].r;
-    float tc = _EdgeTex[uint2(px,                    max(py-1,0))].r;
-    float tr = _EdgeTex[uint2(min(px+1,_TexWidth-1), max(py-1,0))].r;
-    float ml = _EdgeTex[uint2(max(px-1,0),           py)].r;
-    float mr = _EdgeTex[uint2(min(px+1,_TexWidth-1), py)].r;
-    float bl = _EdgeTex[uint2(max(px-1,0),           min(py+1,_TexHeight-1))].r;
-    float bc = _EdgeTex[uint2(px,                    min(py+1,_TexHeight-1))].r;
-    float br = _EdgeTex[uint2(min(px+1,_TexWidth-1), min(py+1,_TexHeight-1))].r;
+    float tl = _EdgeTex[uint2(max(px - 1, 0), max(py - 1, 0))].r;
+    float tc = _EdgeTex[uint2(px, max(py - 1, 0))].r;
+    float tr = _EdgeTex[uint2(min(px + 1, _TexWidth - 1), max(py - 1, 0))].r;
+    float ml = _EdgeTex[uint2(max(px - 1, 0), py)].r;
+    float mr = _EdgeTex[uint2(min(px + 1, _TexWidth - 1), py)].r;
+    float bl = _EdgeTex[uint2(max(px - 1, 0), min(py + 1, _TexHeight - 1))].r;
+    float bc = _EdgeTex[uint2(px, min(py + 1, _TexHeight - 1))].r;
+    float br = _EdgeTex[uint2(min(px + 1, _TexWidth - 1), min(py + 1, _TexHeight - 1))].r;
 
-    float gx = -tl + tr - 2*ml + 2*mr - bl + br;
-    float gy = -tl - 2*tc - tr + bl + 2*bc + br;
+    float gx = -tl + tr - 2 * ml + 2 * mr - bl + br;
+    float gy = -tl - 2 * tc - tr + bl + 2 * bc + br;
     return float2(gx, gy);
+}
+
+void QuantizedStep(float2 dir, out int sx, out int sy)
+{
+    sx = 0;
+    sy = 0;
+
+    float ax = abs(dir.x);
+    float ay = abs(dir.y);
+
+    if (ax >= ay)
+    {
+        sx = dir.x >= 0 ? 1 : -1;
+        if (ay > ax * 0.5) sy = dir.y >= 0 ? 1 : -1;
+    }
+    else
+    {
+        sy = dir.y >= 0 ? 1 : -1;
+        if (ax > ay * 0.5) sx = dir.x >= 0 ? 1 : -1;
+    }
+}
+
+bool IsLocalMaxEdge(int px, int py, float edgeCenter, float2 grad)
+{
+    float gl = length(grad);
+    if (gl < 1e-5) return false;
+
+    float2 n = grad / gl;
+    float2 p = float2((float)px, (float)py);
+    float e1 = SampleEdgeBilinear(p + n);
+    float e2 = SampleEdgeBilinear(p - n);
+    float mx = max(e1, e2);
+    return (edgeCenter + _NmsRelaxation >= mx);
+}
+
+float ComputeSubpixelOffset(float2 p, float2 n)
+{
+    float eM = SampleEdgeBilinear(p - n);
+    float e0 = SampleEdgeBilinear(p);
+    float eP = SampleEdgeBilinear(p + n);
+    float denom = eM - 2.0 * e0 + eP;
+    if (abs(denom) < 1e-6) return 0.0;
+
+    // 1D quadratic peak localization
+    float t = 0.5 * (eM - eP) / denom;
+    return clamp(t, -0.5, 0.5);
+}
+
+float4 SampleWorldPosBilinearValid(float2 p)
+{
+    float2 pp = clamp(p, float2(0, 0), float2(_TexWidth - 1, _TexHeight - 1));
+    int x0 = (int)floor(pp.x);
+    int y0 = (int)floor(pp.y);
+    int x1 = min(x0 + 1, _TexWidth - 1);
+    int y1 = min(y0 + 1, _TexHeight - 1);
+    float fx = pp.x - x0;
+    float fy = pp.y - y0;
+
+    float w00 = (1.0 - fx) * (1.0 - fy);
+    float w10 = fx * (1.0 - fy);
+    float w01 = (1.0 - fx) * fy;
+    float w11 = fx * fy;
+
+    float4 p00 = _WorldPosTex[uint2(x0, y0)];
+    float4 p10 = _WorldPosTex[uint2(x1, y0)];
+    float4 p01 = _WorldPosTex[uint2(x0, y1)];
+    float4 p11 = _WorldPosTex[uint2(x1, y1)];
+
+    float3 sum = float3(0, 0, 0);
+    float sumW = 0;
+    if (IsValidPos(p00)) { sum += p00.xyz * w00; sumW += w00; }
+    if (IsValidPos(p10)) { sum += p10.xyz * w10; sumW += w10; }
+    if (IsValidPos(p01)) { sum += p01.xyz * w01; sumW += w01; }
+    if (IsValidPos(p11)) { sum += p11.xyz * w11; sumW += w11; }
+
+    if (sumW <= 1e-6) return float4(0, 0, 0, 0);
+    return float4(sum / sumW, 1);
+}
+
+[numthreads(8, 8, 1)]
+void BuildEdgePositionBuffer(uint3 id : SV_DispatchThreadID)
+{
+    int px = (int)id.x;
+    int py = (int)id.y;
+    if (px >= _TexWidth || py >= _TexHeight) return;
+
+    float4 outPos = float4(0, 0, 0, 0);
+    float edge = _EdgeTex[uint2(px, py)].r;
+    if (edge > _MinEdgeThreshold)
+    {
+        float2 grad = ComputeEdgeGradient(px, py);
+        if (!IsLocalMaxEdge(px, py, edge, grad))
+        {
+            _RWEdgePosTex[uint2(px, py)] = float4(0, 0, 0, 0);
+            return;
+        }
+
+        float4 wp = float4(0, 0, 0, 0);
+        float gl = length(grad);
+        if (gl > 1e-5)
+        {
+            float2 n = grad / gl;
+            if (_UseGeomDiscontinuityFilter > 0)
+            {
+                int sx, sy;
+                QuantizedStep(n, sx, sy);
+                float4 side1 = _WorldPosTex[uint2(clamp(px + sx, 0, _TexWidth - 1), clamp(py + sy, 0, _TexHeight - 1))];
+                float4 side2 = _WorldPosTex[uint2(clamp(px - sx, 0, _TexWidth - 1), clamp(py - sy, 0, _TexHeight - 1))];
+                bool v1 = IsValidPos(side1);
+                bool v2 = IsValidPos(side2);
+
+                // Her iki taraf da yoksa anlamsiz kenar.
+                if (!v1 && !v2)
+                {
+                    _RWEdgePosTex[uint2(px, py)] = float4(0, 0, 0, 0);
+                    return;
+                }
+
+                // Her iki taraf da var ama geometri farki cok kucukse (smooth/false edge) at.
+                if (v1 && v2)
+                {
+                    float d = length(side1.xyz - side2.xyz);
+                    if (d < _MinGeomDiscontinuity)
+                    {
+                        _RWEdgePosTex[uint2(px, py)] = float4(0, 0, 0, 0);
+                        return;
+                    }
+                }
+            }
+
+            float2 p = float2((float)px, (float)py);
+            float t = ComputeSubpixelOffset(p, n);
+            float2 subPix = p + n * t;
+
+            wp = SampleWorldPosBilinearValid(subPix);
+            if (!IsValidPos(wp))
+            {
+                int ox1 = clamp(px + (int)(n.x * OFFSET), 0, _TexWidth - 1);
+                int oy1 = clamp(py + (int)(n.y * OFFSET), 0, _TexHeight - 1);
+                int ox2 = clamp(px - (int)(n.x * OFFSET), 0, _TexWidth - 1);
+                int oy2 = clamp(py - (int)(n.y * OFFSET), 0, _TexHeight - 1);
+                float4 w1 = _WorldPosTex[uint2(ox1, oy1)];
+                float4 w2 = _WorldPosTex[uint2(ox2, oy2)];
+                bool v1 = IsValidPos(w1);
+                bool v2 = IsValidPos(w2);
+                if (v1 && !v2) wp = w1;
+                else if (!v1 && v2) wp = w2;
+                else if (v1) wp = w1;
+                else if (v2) wp = w2;
+            }
+        }
+        if (!IsValidPos(wp)) wp = _WorldPosTex[uint2(px, py)];
+        if (IsValidPos(wp)) outPos = float4(wp.xyz, 1);
+    }
+    _RWEdgePosTex[uint2(px, py)] = outPos;
 }
 
 [numthreads(8, 8, 1)]
@@ -67,78 +259,90 @@ void FitMicroLines(uint3 id : SV_DispatchThreadID)
     int endY = min(startY + k, _TexHeight);
     if (startX >= _TexWidth || startY >= _TexHeight) return;
 
-    // Kernel merkezini al
-    int cx = (startX + endX) / 2;
-    int cy = (startY + endY) / 2;
-
-    // ===== SILHOUETTE TESPİTİ =====
-    bool isSilhouette = false;
-    float2 silhouetteDir = float2(0, 0);
-
-    float centerEdge = _EdgeTex[uint2(cx, cy)].r;
-    if (centerEdge > _MinEdgeThreshold)
-    {
-        float2 grad = ComputeEdgeGradient(cx, cy);
-        float gradLen = length(grad);
-        if (gradLen > 0.001)
-        {
-            float2 perpDir = normalize(grad);
-
-            int ox1 = clamp(cx + (int)(perpDir.x * OFFSET), 0, _TexWidth  - 1);
-            int oy1 = clamp(cy + (int)(perpDir.y * OFFSET), 0, _TexHeight - 1);
-            int ox2 = clamp(cx - (int)(perpDir.x * OFFSET), 0, _TexWidth  - 1);
-            int oy2 = clamp(cy - (int)(perpDir.y * OFFSET), 0, _TexHeight - 1);
-
-            bool v1 = (_WorldPosTex[uint2(ox1, oy1)].w > 0);
-            bool v2 = (_WorldPosTex[uint2(ox2, oy2)].w > 0);
-
-            if (v1 && !v2)
-            {
-                isSilhouette = true;
-                silhouetteDir = perpDir;
-            }
-            else if (!v1 && v2)
-            {
-                isSilhouette = true;
-                silhouetteDir = -perpDir;
-            }
-        }
-    }
-
-    // ===== 1. EDGE NOKTALARINI TOPLA (3D) =====
     float3 pts3d[MAX_PTS];
     int cnt = 0;
-
     for (int py = startY; py < endY; py++)
     {
         for (int px = startX; px < endX; px++)
         {
-            if (_EdgeTex[uint2(px, py)].r <= _MinEdgeThreshold) continue;
-
-            float4 wp;
-            if (isSilhouette)
-            {
-                int ox = clamp(px + (int)(silhouetteDir.x * OFFSET), 0, _TexWidth  - 1);
-                int oy = clamp(py + (int)(silhouetteDir.y * OFFSET), 0, _TexHeight - 1);
-                wp = _WorldPosTex[uint2(ox, oy)];
-            }
-            else
-            {
-                wp = _WorldPosTex[uint2(px, py)];
-            }
-
-            if (wp.w <= 0) continue;
-
-            pts3d[cnt] = wp.xyz;
+            float4 ep = _EdgePosTex[uint2(px, py)];
+            if (ep.w <= 0) continue;
+            pts3d[cnt] = ep.xyz;
             cnt++;
             if (cnt >= MAX_PTS) break;
         }
         if (cnt >= MAX_PTS) break;
     }
-
     if (cnt < _MinPointsForLine) return;
 
-    // Debug mode: raw edge piksel pozisyonlarını çıkar
+    // Z-band outlier suppression:
+    // Duz kisimlarda tutarli olan Z kumesini secip digerlerini eler.
+    // Bu, curve tepesindeki yanlis yuzeye sicrayan noktalarin etkisini azaltir.
+    {
+        float zMin = 1e20;
+        float zMax = -1e20;
+        for (int zi = 0; zi < cnt; zi++)
+        {
+            float z = pts3d[zi].z;
+            zMin = min(zMin, z);
+            zMax = max(zMax, z);
+        }
+
+        float zRange = zMax - zMin;
+        if (zRange > 1e-5)
+        {
+            const int Z_BINS = 8;
+            int hist[Z_BINS];
+            [unroll] for (int bi = 0; bi < Z_BINS; bi++) hist[bi] = 0;
+
+            float invRange = 1.0 / zRange;
+            for (int zi = 0; zi < cnt; zi++)
+            {
+                float zn = saturate((pts3d[zi].z - zMin) * invRange);
+                int b = min((int)(zn * (float)Z_BINS), Z_BINS - 1);
+                hist[b]++;
+            }
+
+            int bestBin = 0;
+            int bestCountBin = hist[0];
+            [unroll]
+            for (int bi = 1; bi < Z_BINS; bi++)
+            {
+                if (hist[bi] > bestCountBin)
+                {
+                    bestCountBin = hist[bi];
+                    bestBin = bi;
+                }
+            }
+
+            float binSize = zRange / (float)Z_BINS;
+            float zCenter = zMin + ((float)bestBin + 0.5) * binSize;
+            float zBand = max(binSize * 0.9, 0.0025);
+            float dominantRatio = (float)bestCountBin / (float)cnt;
+
+            float3 tmpPts[MAX_PTS];
+            int keep = 0;
+            for (int zi = 0; zi < cnt; zi++)
+            {
+                if (abs(pts3d[zi].z - zCenter) <= zBand)
+                {
+                    tmpPts[keep] = pts3d[zi];
+                    keep++;
+                }
+            }
+
+            // Z-band sadece gerçekten baskin bir mode varsa uygula.
+            // Aksi halde (egri/oval bölgeler) gereksiz kopukluk olusturabiliyor.
+            bool strongDominant = dominantRatio >= 0.58;
+            bool enoughRange = zRange > max(_InlierThreshold * 2.0, 0.004);
+            if (strongDominant && enoughRange && keep >= max(_MinPointsForLine, 4))
+            {
+                cnt = keep;
+                for (int zi = 0; zi < cnt; zi++) pts3d[zi] = tmpPts[zi];
+            }
+        }
+    }
+
     if (_DebugMode > 0)
     {
         for (int di = 0; di < cnt; di++)
@@ -151,21 +355,14 @@ void FitMicroLines(uint3 id : SV_DispatchThreadID)
         return;
     }
 
-    // =========================================================
-    // DIRECT 3D RANSAC: Doğrudan 3D pozisyonlarda çizgi bul
-    // =========================================================
-    
     float thSq3D = _InlierThreshold * _InlierThreshold;
-    float segSq  = _MaxSegLength * _MaxSegLength;
-    
+    float segSq = _MaxSegLength * _MaxSegLength;
     uint seed = WangHash(id.x + id.y * 65537u + _FrameSeed * 7919u + 1u);
-    
     int bestCount = 0;
     int bestI1 = 0;
     int bestI2 = 0;
-    
     int maxIter = min(60, (int)((uint)cnt * ((uint)cnt - 1u) / 2u));
-    
+
     for (int it = 0; it < maxIter; it++)
     {
         seed = WangHash(seed);
@@ -173,16 +370,14 @@ void FitMicroLines(uint3 id : SV_DispatchThreadID)
         seed = WangHash(seed);
         int i2 = seed % (uint)cnt;
         if (i2 == i1) continue;
-        
+
         float3 a = pts3d[i1];
         float3 b = pts3d[i2];
-        
         float3 ab = b - a;
         float abLenSq = dot(ab, ab);
         if (abLenSq > segSq || abLenSq < 1e-16) continue;
-        
+
         float3 dir = ab / sqrt(abLenSq);
-        
         int inl = 0;
         for (int ik = 0; ik < cnt; ik++)
         {
@@ -190,7 +385,6 @@ void FitMicroLines(uint3 id : SV_DispatchThreadID)
             float3 cr = cross(d, dir);
             if (dot(cr, cr) < thSq3D) inl++;
         }
-        
         if (inl > bestCount)
         {
             bestCount = inl;
@@ -198,21 +392,19 @@ void FitMicroLines(uint3 id : SV_DispatchThreadID)
             bestI2 = i2;
         }
     }
-    
-    if (bestCount < _MinPointsForLine) return;
-    
-    // =========================================================
-    // PCA REFINEMENT: RANSAC inlier'ları üzerinde hassas yön
-    // =========================================================
-    
+    int minSupport = max(_MinPointsForLine, 3);
+    if (bestCount < minSupport) return;
+    float inlierRatio = (float)bestCount / (float)cnt;
+    float ratioRelaxT = saturate((float)cnt / 16.0);
+    float effMinInlierRatio = lerp(_MinInlierRatio * 0.78, _MinInlierRatio, ratioRelaxT);
+    if (inlierRatio < effMinInlierRatio) return;
+
     float3 bestA = pts3d[bestI1];
     float3 bestB = pts3d[bestI2];
     float3 bestDir = normalize(bestB - bestA);
-    
-    // RANSAC inlier'larının 3D ortalaması
+
     float3 mean3d = float3(0, 0, 0);
     int inlierCount = 0;
-    
     for (int ik = 0; ik < cnt; ik++)
     {
         float3 d = pts3d[ik] - bestA;
@@ -223,14 +415,11 @@ void FitMicroLines(uint3 id : SV_DispatchThreadID)
             inlierCount++;
         }
     }
-    
-    if (inlierCount < _MinPointsForLine) return;
+    if (inlierCount < minSupport) return;
     mean3d /= (float)inlierCount;
-    
-    // 3x3 kovaryans matrisi (sadece inlier'lar)
+
     float c11 = 0, c12 = 0, c13 = 0;
     float c22 = 0, c23 = 0, c33 = 0;
-    
     for (int ik = 0; ik < cnt; ik++)
     {
         float3 d = pts3d[ik] - bestA;
@@ -243,10 +432,8 @@ void FitMicroLines(uint3 id : SV_DispatchThreadID)
             c33 += dv.z * dv.z;
         }
     }
-    
-    // Power iteration → hassas 3D çizgi yönü
-    float3 v = bestDir; // RANSAC yönünü başlangıç olarak kullan
-    
+
+    float3 v = bestDir;
     for (int pi = 0; pi < 8; pi++)
     {
         float3 Cv = float3(
@@ -258,11 +445,11 @@ void FitMicroLines(uint3 id : SV_DispatchThreadID)
         if (cvLen > 1e-10) v = Cv / cvLen;
         else break;
     }
-    
-    // Tüm inlier'ları PCA yönüne projekte et → min/max endpoint
+
     float minP = 1e10;
     float maxP = -1e10;
-    
+    float perpAccum = 0;
+    int perpCount = 0;
     for (int pk = 0; pk < cnt; pk++)
     {
         float3 d = pts3d[pk] - bestA;
@@ -273,15 +460,29 @@ void FitMicroLines(uint3 id : SV_DispatchThreadID)
             float p = dot(dm, v);
             minP = min(minP, p);
             maxP = max(maxP, p);
+
+            float3 q = dm - v * p;
+            perpAccum += dot(q, q);
+            perpCount++;
         }
     }
-    
+
     float segLen = maxP - minP;
     if (segLen < 1e-8 || segLen > _MaxSegLength) return;
-    
+
+    // Cizgisellik filtresi: inlier bulutu line benzeri degilse cikar.
+    if (perpCount > 0)
+    {
+        float alongVar = (segLen * segLen) * 0.0833333; // uniform segment var ~ L^2/12
+        float perpVar = perpAccum / (float)perpCount;
+        float linRelaxT = saturate((float)perpCount / 12.0);
+        float effLinearity = lerp(_MinLinearityFactor * 0.68, _MinLinearityFactor, linRelaxT);
+        effLinearity = max(effLinearity, 1.05);
+        if (alongVar < perpVar * effLinearity) return;
+    }
+
     float3 segStart = mean3d + v * minP;
-    float3 segEnd   = mean3d + v * maxP;
-    
+    float3 segEnd = mean3d + v * maxP;
     MicroLine ml;
     ml.sx = segStart.x; ml.sy = segStart.y; ml.sz = segStart.z;
     ml.ex = segEnd.x;   ml.ey = segEnd.y;   ml.ez = segEnd.z;
