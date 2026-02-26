@@ -1,6 +1,5 @@
 using UnityEngine;
 using UnityEngine.Rendering;
-using Unity.Mathematics;
 using Unity.Collections;
 using System.Runtime.InteropServices;
 using System.Diagnostics;
@@ -68,35 +67,11 @@ namespace SceneCapture.Edge3D
         public bool showLines = true;
         [Range(1f, 15f)] public float visualLineThickness = 4.0f;
 
-        [Header("Line Regularization")]
-        [Tooltip("Kapaliysa post-process dogrultu duzeltmeleri uygulanmaz, sadece compute/RANSAC sonucu cizilir.")]
-        public bool usePostRegularization = false;
-        [Tooltip("Bulunan mikro-line'lari baskin yonde duzeltir (capsule tepesindeki caprazlari azaltir).")]
-        public bool regularizeLineDirections = true;
-        [Range(1f, 45f)] public float regularizationAngleDeg = 18f;
-        [Range(0.0001f, 0.1f)] public float regularizationMinLength = 0.01f;
-        [Tooltip("Baskin yonden cok sapan line'lari tamamen siler.")]
-        public bool removeDirectionOutliers = true;
-        [Range(1f, 45f)] public float outlierAngleDeg = 28f;
-        [Tooltip("Line merkezlerini tek bir referans hatta yaklastirir (zigzag'i duzeltir).")]
-        public bool stabilizeLineCenter = true;
-        [Range(0f, 1f)] public float centerSnapStrength = 0.85f;
-        [Range(0.001f, 0.2f)] public float maxLateralDistance = 0.04f;
-        [Tooltip("Tum mikro-line'lari tek baskin hatta indirger (sphere/capsule icin ideal).")]
-        public bool collapseToSingleDominantLine = false;
-        [Tooltip("Baskin yonu aci-inlier tabanli robust fit ile hesaplar.")]
-        public bool robustDirectionFit = true;
-        [Range(1f, 45f)] public float robustDirectionInlierAngleDeg = 18f;
-
-        [Header("Point Cloud Visualization")]
-        public bool showPointCloud = false;
-        public Color pointCloudColor = Color.green;
-        [Range(0.001f, 0.1f)] public float pointSize = 0.01f;
-
         [Header("Debug: Raw Edge Points")]
         [Tooltip("Edge piksellerinin ham 3D pozisyonlarını gösterir (RANSAC öncesi)")]
         public bool showRawEdgePoints = false;
         public Color rawPointColor = Color.cyan;
+        [Range(0.001f, 0.1f)] public float rawPointSize = 0.01f;
 
         [Header("Performance (Read-Only)")]
         public bool showPerformance = true;
@@ -361,326 +336,6 @@ namespace SceneCapture.Edge3D
             _lineCountDisplay = lineCount;
         }
 
-        int RegularizeLinesInPlace(int lineCount)
-        {
-            if (_displayLines == null || lineCount <= 1) return lineCount;
-            if (!regularizeLineDirections && !removeDirectionOutliers) return lineCount;
-
-            // 1) Frame'in baskin yonunu bul (ilk eleman yerine en uzun line'dan seed al)
-            Vector3 v = Vector3.up;
-            bool hasSeed = false;
-            float maxSeedLen = 0f;
-
-            for (int i = 0; i < lineCount; i++)
-            {
-                var l = _displayLines[i];
-                Vector3 d = new Vector3(l.ex - l.sx, l.ey - l.sy, l.ez - l.sz);
-                float len = d.magnitude;
-                if (len < regularizationMinLength) continue;
-                if (len > maxSeedLen)
-                {
-                    maxSeedLen = len;
-                    v = d / len;
-                    hasSeed = true;
-                }
-            }
-            if (!hasSeed) return lineCount;
-
-            for (int it = 0; it < 8; it++)
-            {
-                Vector3 sum = Vector3.zero;
-                for (int i = 0; i < lineCount; i++)
-                {
-                    var l = _displayLines[i];
-                    Vector3 d = new Vector3(l.ex - l.sx, l.ey - l.sy, l.ez - l.sz);
-                    float len = d.magnitude;
-                    if (len < regularizationMinLength) continue;
-
-                    Vector3 n = d / len;
-                    float w = len;
-                    float proj = Vector3.Dot(n, v);
-                    sum += n * (proj * proj * w);
-                }
-                if (sum.sqrMagnitude < 1e-10f) break;
-                v = sum.normalized;
-            }
-
-            if (robustDirectionFit)
-                v = ComputeRobustDirection(lineCount, v);
-
-            float cosThreshold = Mathf.Cos(regularizationAngleDeg * Mathf.Deg2Rad);
-            float cosOutlier = Mathf.Cos(outlierAngleDeg * Mathf.Deg2Rad);
-
-            // Outlier temizliği bu frame'de çok agresif olacaksa otomatik gevşet.
-            int predictedKeep = 0;
-            if (removeDirectionOutliers)
-            {
-                for (int i = 0; i < lineCount; i++)
-                {
-                    var l = _displayLines[i];
-                    Vector3 d = new Vector3(l.ex - l.sx, l.ey - l.sy, l.ez - l.sz);
-                    float len = d.magnitude;
-                    if (len < regularizationMinLength) { predictedKeep++; continue; }
-                    Vector3 n = d / len;
-                    float ad = Mathf.Abs(Vector3.Dot(n, v));
-                    if (ad >= cosOutlier) predictedKeep++;
-                }
-            }
-            bool applyOutlierThisFrame = removeDirectionOutliers && predictedKeep >= Mathf.Max(8, Mathf.RoundToInt(lineCount * 0.25f));
-
-            // 2) Baskin yone yakin line'lari bu yone snap et
-            for (int i = 0; i < lineCount; i++)
-            {
-                var l = _displayLines[i];
-                Vector3 s = new Vector3(l.sx, l.sy, l.sz);
-                Vector3 e = new Vector3(l.ex, l.ey, l.ez);
-                Vector3 d = e - s;
-                float len = d.magnitude;
-                if (len < regularizationMinLength) continue;
-
-                Vector3 n = d / len;
-                float ad = Mathf.Abs(Vector3.Dot(n, v));
-                if (applyOutlierThisFrame && ad < cosOutlier)
-                {
-                    // Outlier'i silmek icin uzunlugu 0'a cek; asagida compaction yapilacak.
-                    l.ex = l.sx; l.ey = l.sy; l.ez = l.sz;
-                    _displayLines[i] = l;
-                    continue;
-                }
-                if (ad < cosThreshold) continue;
-
-                // Yon isaretini koru, merkez ve uzunlugu degistirme.
-                Vector3 dir = Vector3.Dot(n, v) >= 0 ? v : -v;
-                Vector3 c = (s + e) * 0.5f;
-                Vector3 hs = dir * (len * 0.5f);
-
-                l.sx = c.x - hs.x; l.sy = c.y - hs.y; l.sz = c.z - hs.z;
-                l.ex = c.x + hs.x; l.ey = c.y + hs.y; l.ez = c.z + hs.z;
-                _displayLines[i] = l;
-            }
-
-            // 2.5) Merkezleri referans hatta yaklastir (acisal degil konumsal zigzag'i azalt)
-            if (stabilizeLineCenter)
-            {
-                Vector3 meanCenter = Vector3.zero;
-                float meanW = 0f;
-
-                // Referans merkez: baskin yone yakin segmentlerin agirlikli ortalamasi
-                for (int i = 0; i < lineCount; i++)
-                {
-                    var l = _displayLines[i];
-                    Vector3 s = new Vector3(l.sx, l.sy, l.sz);
-                    Vector3 e = new Vector3(l.ex, l.ey, l.ez);
-                    Vector3 d = e - s;
-                    float len = d.magnitude;
-                    if (len < regularizationMinLength) continue;
-
-                    Vector3 n = d / len;
-                    float ad = Mathf.Abs(Vector3.Dot(n, v));
-                    if (ad < cosThreshold) continue;
-
-                    Vector3 c = (s + e) * 0.5f;
-                    float w = len * ad;
-                    meanCenter += c * w;
-                    meanW += w;
-                }
-
-                if (meanW > 1e-6f)
-                {
-                    meanCenter /= meanW;
-
-                    for (int i = 0; i < lineCount; i++)
-                    {
-                        var l = _displayLines[i];
-                        Vector3 s = new Vector3(l.sx, l.sy, l.sz);
-                        Vector3 e = new Vector3(l.ex, l.ey, l.ez);
-                        Vector3 d = e - s;
-                        float len = d.magnitude;
-                        if (len < regularizationMinLength) continue;
-
-                        Vector3 n = d / len;
-                        float ad = Mathf.Abs(Vector3.Dot(n, v));
-                        if (ad < cosThreshold) continue;
-
-                        Vector3 c = (s + e) * 0.5f;
-                        Vector3 toC = c - meanCenter;
-                        Vector3 perp = toC - v * Vector3.Dot(toC, v);
-                        float lateral = perp.magnitude;
-
-                        if (removeDirectionOutliers && lateral > maxLateralDistance)
-                        {
-                            l.ex = l.sx; l.ey = l.sy; l.ez = l.sz;
-                            _displayLines[i] = l;
-                            continue;
-                        }
-
-                        Vector3 cSnapped = c - perp * centerSnapStrength;
-                        Vector3 hs = n * (len * 0.5f);
-                        l.sx = cSnapped.x - hs.x; l.sy = cSnapped.y - hs.y; l.sz = cSnapped.z - hs.z;
-                        l.ex = cSnapped.x + hs.x; l.ey = cSnapped.y + hs.y; l.ez = cSnapped.z + hs.z;
-                        _displayLines[i] = l;
-                    }
-                }
-            }
-
-            // 3) Uzunlugu sifirlanan outlier'lari diziden cikar
-            if (applyOutlierThisFrame)
-            {
-                int write = 0;
-                for (int i = 0; i < lineCount; i++)
-                {
-                    var l = _displayLines[i];
-                    float dx = l.ex - l.sx;
-                    float dy = l.ey - l.sy;
-                    float dz = l.ez - l.sz;
-                    float lenSq = dx * dx + dy * dy + dz * dz;
-                    // Sadece bilincli olarak sifirladigimiz outlier'lari cikar.
-                    if (lenSq <= 1e-12f) continue;
-                    _displayLines[write++] = l;
-                }
-                lineCount = write;
-            }
-
-            if (collapseToSingleDominantLine)
-                return CollapseToSingleDominantLine(lineCount, v);
-
-            return lineCount;
-        }
-
-        Vector3 ComputeRobustDirection(int lineCount, Vector3 seedDir)
-        {
-            if (_displayLines == null || lineCount <= 0) return seedDir;
-            Vector3 bestDir = seedDir.sqrMagnitude > 1e-8f ? seedDir.normalized : Vector3.up;
-            float bestScore = -1f;
-            float cosInlier = Mathf.Cos(robustDirectionInlierAngleDeg * Mathf.Deg2Rad);
-
-            // Her line yonunu aday kabul et; en cok aci-inlier toplayani sec.
-            for (int i = 0; i < lineCount; i++)
-            {
-                var li = _displayLines[i];
-                Vector3 di = new Vector3(li.ex - li.sx, li.ey - li.sy, li.ez - li.sz);
-                float leni = di.magnitude;
-                if (leni < regularizationMinLength) continue;
-                Vector3 ci = di / leni;
-
-                float score = 0f;
-                for (int j = 0; j < lineCount; j++)
-                {
-                    var lj = _displayLines[j];
-                    Vector3 dj = new Vector3(lj.ex - lj.sx, lj.ey - lj.sy, lj.ez - lj.sz);
-                    float lenj = dj.magnitude;
-                    if (lenj < regularizationMinLength) continue;
-                    Vector3 nj = dj / lenj;
-                    float ad = Mathf.Abs(Vector3.Dot(nj, ci));
-                    if (ad < cosInlier) continue;
-                    score += lenj * ad * ad;
-                }
-
-                if (score > bestScore)
-                {
-                    bestScore = score;
-                    bestDir = ci;
-                }
-            }
-
-            // Secilen yon etrafindaki inlier'lardan imzali ortalama ile son yonu rafine et.
-            Vector3 refined = Vector3.zero;
-            for (int i = 0; i < lineCount; i++)
-            {
-                var l = _displayLines[i];
-                Vector3 d = new Vector3(l.ex - l.sx, l.ey - l.sy, l.ez - l.sz);
-                float len = d.magnitude;
-                if (len < regularizationMinLength) continue;
-                Vector3 n = d / len;
-                float dot = Vector3.Dot(n, bestDir);
-                float ad = Mathf.Abs(dot);
-                if (ad < cosInlier) continue;
-                refined += (dot >= 0f ? n : -n) * (len * ad);
-            }
-
-            if (refined.sqrMagnitude > 1e-10f)
-                bestDir = refined.normalized;
-
-            return bestDir;
-        }
-
-        int CollapseToSingleDominantLine(int lineCount, Vector3 seedDir)
-        {
-            if (_displayLines == null || lineCount <= 0) return 0;
-
-            Vector3 mean = Vector3.zero;
-            float wsum = 0f;
-            for (int i = 0; i < lineCount; i++)
-            {
-                var l = _displayLines[i];
-                Vector3 s = new Vector3(l.sx, l.sy, l.sz);
-                Vector3 e = new Vector3(l.ex, l.ey, l.ez);
-                float len = (e - s).magnitude;
-                if (len < regularizationMinLength) continue;
-                Vector3 c = (s + e) * 0.5f;
-                mean += c * len;
-                wsum += len;
-            }
-            if (wsum <= 1e-6f) return 0;
-            mean /= wsum;
-
-            // Basit power-iteration ile baskin yon
-            Vector3 v = seedDir.sqrMagnitude > 1e-8f ? seedDir.normalized : Vector3.up;
-            for (int it = 0; it < 8; it++)
-            {
-                Vector3 sum = Vector3.zero;
-                for (int i = 0; i < lineCount; i++)
-                {
-                    var l = _displayLines[i];
-                    Vector3 s = new Vector3(l.sx, l.sy, l.sz);
-                    Vector3 e = new Vector3(l.ex, l.ey, l.ez);
-                    float len = (e - s).magnitude;
-                    if (len < regularizationMinLength) continue;
-                    Vector3 c = (s + e) * 0.5f;
-                    Vector3 q = c - mean;
-                    float p = Vector3.Dot(q, v);
-                    sum += q * (p * len);
-                }
-                if (sum.sqrMagnitude < 1e-10f) break;
-                v = sum.normalized;
-            }
-
-            float minProj = float.MaxValue;
-            float maxProj = float.MinValue;
-            bool hasAny = false;
-
-            // Uclari axis'e projekte edip toplam kapsami bul
-            for (int i = 0; i < lineCount; i++)
-            {
-                var l = _displayLines[i];
-                Vector3 s = new Vector3(l.sx, l.sy, l.sz);
-                Vector3 e = new Vector3(l.ex, l.ey, l.ez);
-                float len = (e - s).magnitude;
-                if (len < regularizationMinLength) continue;
-
-                Vector3 ds = s - mean;
-                Vector3 de = e - mean;
-                float ps = Vector3.Dot(ds, v);
-                float pe = Vector3.Dot(de, v);
-
-                minProj = Mathf.Min(minProj, Mathf.Min(ps, pe));
-                maxProj = Mathf.Max(maxProj, Mathf.Max(ps, pe));
-                hasAny = true;
-            }
-
-            if (!hasAny || maxProj <= minProj) return 0;
-
-            Vector3 a = mean + v * minProj;
-            Vector3 b = mean + v * maxProj;
-
-            _displayLines[0] = new MicroLine
-            {
-                sx = a.x, sy = a.y, sz = a.z,
-                ex = b.x, ey = b.y, ez = b.z
-            };
-            return 1;
-        }
-
         void OnDrawGizmos()
         {
             if (!_hasNewData) return;
@@ -700,19 +355,6 @@ namespace SceneCapture.Edge3D
 #endif
             }
 
-            if (showPointCloud)
-            {
-                Gizmos.color = pointCloudColor;
-                for (int i = 0; i < _displayLineCount; i++)
-                {
-                    var l = _displayLines[i];
-                    Gizmos.DrawSphere(new Vector3(
-                        (l.sx + l.ex) * 0.5f,
-                        (l.sy + l.ey) * 0.5f,
-                        (l.sz + l.ez) * 0.5f), pointSize);
-                }
-            }
-
             // Raw edge pixel pozisyonları (debug)
             if (showRawEdgePoints && _debugPoints != null)
             {
@@ -720,7 +362,7 @@ namespace SceneCapture.Edge3D
                 for (int i = 0; i < _debugPointCount; i++)
                 {
                     var p = _debugPoints[i];
-                    Gizmos.DrawSphere(new Vector3(p.sx, p.sy, p.sz), pointSize);
+                    Gizmos.DrawSphere(new Vector3(p.sx, p.sy, p.sz), rawPointSize);
                 }
             }
         }

@@ -51,6 +51,24 @@ bool IsValidPos(float4 p)
     return p.w > 0.5;
 }
 
+bool HasInvalidWorldNeighbor(int px, int py)
+{
+    [unroll]
+    for (int dy = -1; dy <= 1; dy++)
+    {
+        [unroll]
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            if (dx == 0 && dy == 0) continue;
+            int nx = clamp(px + dx, 0, _TexWidth - 1);
+            int ny = clamp(py + dy, 0, _TexHeight - 1);
+            float4 wp = _WorldPosTex[uint2(nx, ny)];
+            if (!IsValidPos(wp)) return true;
+        }
+    }
+    return false;
+}
+
 float SampleEdge(int x, int y)
 {
     int cx = clamp(x, 0, _TexWidth - 1);
@@ -216,8 +234,15 @@ void BuildEdgePositionBuffer(uint3 id : SV_DispatchThreadID)
                     float d = length(side1.xyz - side2.xyz);
                     if (d < _MinGeomDiscontinuity)
                     {
-                        _RWEdgePosTex[uint2(px, py)] = float4(0, 0, 0, 0);
-                        return;
+                        // Gercek sinir/oyuk kenarlarinda etrafta gecersiz komsu olur.
+                        // Bu durumda eleme yapma; sadece tam smooth false-edge'leri ele.
+                        bool hasInvalidNbr = HasInvalidWorldNeighbor(px, py);
+                        bool strongEdge = edge > (_MinEdgeThreshold * 1.9);
+                        if (!hasInvalidNbr && !strongEdge)
+                        {
+                            _RWEdgePosTex[uint2(px, py)] = float4(0, 0, 0, 0);
+                            return;
+                        }
                     }
                 }
             }
