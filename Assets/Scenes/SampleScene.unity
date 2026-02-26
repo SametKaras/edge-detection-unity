@@ -663,8 +663,10 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 685c5d7e35d307d4fada9963cef5f41d, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::SceneCapture.EdgeDetectionEffect
-  method: 1
+  method: 0
   source: 3
+  useDepthForLineFitting: 1
+  lineEdgeThreshold: 0.08
   edgeThreshold: 0.25
   edgeColor: {r: 1, g: 1, b: 1, a: 1}
   backgroundColor: {r: 0, g: 0, b: 0, a: 1}
@@ -735,14 +737,26 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::SceneCapture.Edge3D.WorldSpaceEdgeManager
   worldPosShader: {fileID: 4800000, guid: 0af80563903413747b9a9c0e0877549c, type: 3}
   microLineCS: {fileID: 7200000, guid: 0947c1e8888d4ea46bbbddbef0ec7809, type: 3}
-  updateInterval: 0.1
+  updateInterval: 0.01
   minEdgeLuminance: 0.1
   kernelSize: 5
-  minPointsForLine: 2
+  minPointsForLine: 4
   inlierThreshold: 0.08
-  maxSegmentLength: 0.15
+  maxSegmentLength: 0.5
   showLines: 1
   visualLineThickness: 4
+  usePostRegularization: 0
+  regularizeLineDirections: 0
+  regularizationAngleDeg: 18
+  regularizationMinLength: 0.01
+  removeDirectionOutliers: 0
+  outlierAngleDeg: 28
+  stabilizeLineCenter: 0
+  centerSnapStrength: 0.85
+  maxLateralDistance: 0.04
+  collapseToSingleDominantLine: 0
+  robustDirectionFit: 0
+  robustDirectionInlierAngleDeg: 18
   showPointCloud: 0
   pointCloudColor: {r: 0, g: 1, b: 0, a: 1}
   pointSize: 0.01
