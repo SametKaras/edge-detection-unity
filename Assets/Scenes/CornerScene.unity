@@ -380,7 +380,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 685c5d7e35d307d4fada9963cef5f41d, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::SceneCapture.EdgeDetectionEffect
-  method: 1
+  method: 0
   source: 3
   edgeThreshold: 0.25
   edgeColor: {r: 1, g: 1, b: 1, a: 1}
@@ -391,6 +391,7 @@ MonoBehaviour:
   depthSensitivity: 0.1
   maxDepth: 50
   normalSensitivity: 10
+  minCreaseAngleDeg: 26
   invertOutput: 0
 --- !u!114 &963194232
 MonoBehaviour:
@@ -453,15 +454,43 @@ MonoBehaviour:
   microLineCS: {fileID: 7200000, guid: 0947c1e8888d4ea46bbbddbef0ec7809, type: 3}
   updateInterval: 0.1
   minEdgeLuminance: 0.1
+  nmsRelaxation: 0.008
+  useGeomDiscontinuityFilter: 1
+  minGeomDiscontinuity: 0.006
   kernelSize: 5
   minPointsForLine: 2
   inlierThreshold: 0.08
   maxSegmentLength: 0.15
+  autoScaleKernelWithResolution: 1
+  referenceHeight: 1080
+  kernelScaleExponent: 1
+  autoScaleMinPointsForLine: 1
+  minPointAreaRatio: 0.08
+  maxAutoMinPoints: 14
+  minInlierRatio: 0.52
+  minLinearityFactor: 1.5
   showLines: 1
   visualLineThickness: 4
+  enableSegmentStitching: 1
+  stitchDistance: 0.006
+  stitchAngleDeg: 22
+  usePostRegularization: 0
+  regularizeLineDirections: 1
+  regularizationAngleDeg: 18
+  regularizationMinLength: 0.01
+  removeDirectionOutliers: 1
+  outlierAngleDeg: 28
+  stabilizeLineCenter: 1
+  centerSnapStrength: 0.85
+  maxLateralDistance: 0.04
+  collapseToSingleDominantLine: 0
+  robustDirectionFit: 1
+  robustDirectionInlierAngleDeg: 18
   showPointCloud: 0
   pointCloudColor: {r: 0, g: 1, b: 0, a: 1}
   pointSize: 0.01
+  showRawEdgePoints: 0
+  rawPointColor: {r: 0, g: 1, b: 1, a: 1}
   showPerformance: 1
   _algorithmMs: 0
   _readbackMs: 0
