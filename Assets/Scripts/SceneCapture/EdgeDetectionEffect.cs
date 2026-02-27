@@ -35,15 +35,26 @@ namespace SceneCapture
                  "0° = tüm normal farkları edge, 90° = yalnızca dik köşeler edge.")]
         [Range(0f, 90f)] public float minCreaseAngleDeg = 26f;
 
+        [Header("Algorithm Edge AA")]
+        [Tooltip("Algoritma icin edge texture'i once daha yuksek cozumlulukte ureterek aliasing'i azaltir.")]
+        public bool useAlgorithmSupersampling = true;
+        [Range(1, 3)] public int algorithmSupersampleScale = 2;
+        [Tooltip("Algoritma edge texture'ina hafif blur uygular (merdiven etkisini azaltir).")]
+        [Range(0, 2)] public int algorithmSmoothPasses = 1;
+        [Tooltip("AA/downsample sonrasi zayiflayan raw edge magnitude'i telafi eder.")]
+        [Range(0.5f, 4f)] public float algorithmMagnitudeScale = 1.6f;
+
         public bool invertOutput = false;
         
         public enum EdgeMethod { Sobel, Roberts, Prewitt }
         public enum EdgeSource { Luminance, Depth, Normal, Combined }
         
-        public RenderTexture EdgeResultTexture { get; private set; }
+        public RenderTexture EdgeResultTexture => _edgeResultTexture;
 
         private Material _material;
         private Camera _camera;
+        private RenderTexture _edgeResultTexture;
+        private RenderTexture _algorithmEdgeRT;
         
         private static readonly string[] MethodKeywords = { "_METHOD_SOBEL", "_METHOD_ROBERTS", "_METHOD_PREWITT" };
         private static readonly string[] SourceKeywords = { "_SOURCE_LUMINANCE", "_SOURCE_DEPTH", "_SOURCE_NORMAL", "_SOURCE_COMBINED" };
@@ -60,7 +71,19 @@ namespace SceneCapture
         void OnDisable()
         {
             if (_material != null) DestroyImmediate(_material);
-            if (EdgeResultTexture != null) { EdgeResultTexture.Release(); EdgeResultTexture = null; }
+            if (_edgeResultTexture != null) { _edgeResultTexture.Release(); _edgeResultTexture = null; }
+            if (_algorithmEdgeRT != null) { _algorithmEdgeRT.Release(); _algorithmEdgeRT = null; }
+        }
+
+        void EnsureRT(ref RenderTexture rt, int w, int h, RenderTextureFormat fmt, bool randomWrite, FilterMode filter)
+        {
+            if (rt != null && rt.width == w && rt.height == h) return;
+            if (rt != null) rt.Release();
+            rt = new RenderTexture(w, h, 0, fmt);
+            rt.enableRandomWrite = randomWrite;
+            rt.filterMode = filter;
+            rt.wrapMode = TextureWrapMode.Clamp;
+            rt.Create();
         }
 
         void OnRenderImage(RenderTexture src, RenderTexture dst)
@@ -91,18 +114,47 @@ namespace SceneCapture
             _material.EnableKeyword(SourceKeywords[(int)source]);
             
             // --- PASS 1: RAW DATA (Algoritma İçin) ---
-            if (EdgeResultTexture == null || EdgeResultTexture.width != src.width || EdgeResultTexture.height != src.height)
+            EnsureRT(ref _edgeResultTexture, src.width, src.height, RenderTextureFormat.RFloat, true, FilterMode.Bilinear);
+
+            int ss = useAlgorithmSupersampling ? Mathf.Clamp(algorithmSupersampleScale, 1, 3) : 1;
+            int algoW = src.width * ss;
+            int algoH = src.height * ss;
+            EnsureRT(ref _algorithmEdgeRT, algoW, algoH, RenderTextureFormat.RFloat, false, FilterMode.Bilinear);
+
+            _material.SetFloat("_MagnitudeScale", algorithmMagnitudeScale);
+            _material.SetFloat("_OutputMagnitude", 1.0f);
+            Graphics.Blit(src, _algorithmEdgeRT, _material);
+
+            // Hafif smoothing + downsample zinciri (algoritma icin)
+            RenderTexture current = _algorithmEdgeRT;
+            for (int i = 0; i < Mathf.Max(0, algorithmSmoothPasses); i++)
             {
-                if (EdgeResultTexture != null) EdgeResultTexture.Release();
-                EdgeResultTexture = new RenderTexture(src.width, src.height, 0, RenderTextureFormat.RFloat);
-                EdgeResultTexture.enableRandomWrite = true;
-                EdgeResultTexture.Create();
+                var tmp = RenderTexture.GetTemporary(current.width, current.height, 0, RenderTextureFormat.RFloat);
+                tmp.filterMode = FilterMode.Bilinear;
+                tmp.wrapMode = TextureWrapMode.Clamp;
+                Graphics.Blit(current, tmp);
+                if (current != _algorithmEdgeRT) RenderTexture.ReleaseTemporary(current);
+                current = tmp;
             }
 
-            _material.SetFloat("_OutputMagnitude", 1.0f);
-            Graphics.Blit(src, EdgeResultTexture, _material);
+            if (current.width != _edgeResultTexture.width || current.height != _edgeResultTexture.height)
+            {
+                var ds = RenderTexture.GetTemporary(_edgeResultTexture.width, _edgeResultTexture.height, 0, RenderTextureFormat.RFloat);
+                ds.filterMode = FilterMode.Bilinear;
+                ds.wrapMode = TextureWrapMode.Clamp;
+                Graphics.Blit(current, ds);
+                Graphics.Blit(ds, _edgeResultTexture);
+                RenderTexture.ReleaseTemporary(ds);
+            }
+            else
+            {
+                Graphics.Blit(current, _edgeResultTexture);
+            }
+
+            if (current != _algorithmEdgeRT) RenderTexture.ReleaseTemporary(current);
 
             // --- PASS 2: VISUAL (Ekran İçin) ---
+            _material.SetFloat("_MagnitudeScale", 1.0f);
             _material.SetFloat("_OutputMagnitude", 0.0f);
             Graphics.Blit(src, dst, _material);
         }

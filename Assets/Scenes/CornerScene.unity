@@ -471,26 +471,9 @@ MonoBehaviour:
   minLinearityFactor: 1.5
   showLines: 1
   visualLineThickness: 4
-  enableSegmentStitching: 1
-  stitchDistance: 0.006
-  stitchAngleDeg: 22
-  usePostRegularization: 0
-  regularizeLineDirections: 1
-  regularizationAngleDeg: 18
-  regularizationMinLength: 0.01
-  removeDirectionOutliers: 1
-  outlierAngleDeg: 28
-  stabilizeLineCenter: 1
-  centerSnapStrength: 0.85
-  maxLateralDistance: 0.04
-  collapseToSingleDominantLine: 0
-  robustDirectionFit: 1
-  robustDirectionInlierAngleDeg: 18
-  showPointCloud: 0
-  pointCloudColor: {r: 0, g: 1, b: 0, a: 1}
-  pointSize: 0.01
   showRawEdgePoints: 0
   rawPointColor: {r: 0, g: 1, b: 1, a: 1}
+  rawPointSize: 0.01
   showPerformance: 1
   _algorithmMs: 0
   _readbackMs: 0

@@ -26,6 +26,7 @@ float _MinEdgeThreshold;
 float _NmsRelaxation;
 int   _UseGeomDiscontinuityFilter;
 float _MinGeomDiscontinuity;
+int   _RequireBoundaryTransition;
 int   _MinPointsForLine;
 float _MinInlierRatio;
 float _MinLinearityFactor;
@@ -69,6 +70,44 @@ bool HasInvalidWorldNeighbor(int px, int py)
     return false;
 }
 
+bool ComputeBoundaryOutwardDir(int px, int py, out float2 outDir)
+{
+    outDir = float2(0, 0);
+    float2 sum = float2(0, 0);
+    float wsum = 0.0;
+
+    [unroll]
+    for (int dy = -1; dy <= 1; dy++)
+    {
+        [unroll]
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            if (dx == 0 && dy == 0) continue;
+            int nx = clamp(px + dx, 0, _TexWidth - 1);
+            int ny = clamp(py + dy, 0, _TexHeight - 1);
+            float4 wp = _WorldPosTex[uint2(nx, ny)];
+            if (!IsValidPos(wp))
+            {
+                float2 d = float2((float)dx, (float)dy);
+                float l = length(d);
+                if (l > 1e-6)
+                {
+                    float w = 1.0 / l;
+                    sum += (d / l) * w;
+                    wsum += w;
+                }
+            }
+        }
+    }
+
+    if (wsum <= 1e-6) return false;
+    float2 n = sum / wsum;
+    float nl = length(n);
+    if (nl <= 1e-5) return false;
+    outDir = n / nl; // object -> background (outward)
+    return true;
+}
+
 float SampleEdge(int x, int y)
 {
     int cx = clamp(x, 0, _TexWidth - 1);
@@ -96,6 +135,34 @@ float SampleEdgeBilinear(float2 p)
     return lerp(e0, e1, fy);
 }
 
+float SampleValid01(int x, int y)
+{
+    int cx = clamp(x, 0, _TexWidth - 1);
+    int cy = clamp(y, 0, _TexHeight - 1);
+    float4 wp = _WorldPosTex[uint2(cx, cy)];
+    return IsValidPos(wp) ? 1.0 : 0.0;
+}
+
+float SampleValidBilinear(float2 p)
+{
+    float2 pp = clamp(p, float2(0, 0), float2(_TexWidth - 1, _TexHeight - 1));
+    int x0 = (int)floor(pp.x);
+    int y0 = (int)floor(pp.y);
+    int x1 = min(x0 + 1, _TexWidth - 1);
+    int y1 = min(y0 + 1, _TexHeight - 1);
+    float fx = pp.x - x0;
+    float fy = pp.y - y0;
+
+    float v00 = SampleValid01(x0, y0);
+    float v10 = SampleValid01(x1, y0);
+    float v01 = SampleValid01(x0, y1);
+    float v11 = SampleValid01(x1, y1);
+
+    float v0 = lerp(v00, v10, fx);
+    float v1 = lerp(v01, v11, fx);
+    return lerp(v0, v1, fy);
+}
+
 float2 ComputeEdgeGradient(int px, int py)
 {
     float tl = _EdgeTex[uint2(max(px - 1, 0), max(py - 1, 0))].r;
@@ -106,6 +173,22 @@ float2 ComputeEdgeGradient(int px, int py)
     float bl = _EdgeTex[uint2(max(px - 1, 0), min(py + 1, _TexHeight - 1))].r;
     float bc = _EdgeTex[uint2(px, min(py + 1, _TexHeight - 1))].r;
     float br = _EdgeTex[uint2(min(px + 1, _TexWidth - 1), min(py + 1, _TexHeight - 1))].r;
+
+    float gx = -tl + tr - 2 * ml + 2 * mr - bl + br;
+    float gy = -tl - 2 * tc - tr + bl + 2 * bc + br;
+    return float2(gx, gy);
+}
+
+float2 ComputeValidityGradient(int px, int py)
+{
+    float tl = SampleValid01(max(px - 1, 0), max(py - 1, 0));
+    float tc = SampleValid01(px, max(py - 1, 0));
+    float tr = SampleValid01(min(px + 1, _TexWidth - 1), max(py - 1, 0));
+    float ml = SampleValid01(max(px - 1, 0), py);
+    float mr = SampleValid01(min(px + 1, _TexWidth - 1), py);
+    float bl = SampleValid01(max(px - 1, 0), min(py + 1, _TexHeight - 1));
+    float bc = SampleValid01(px, min(py + 1, _TexHeight - 1));
+    float br = SampleValid01(min(px + 1, _TexWidth - 1), min(py + 1, _TexHeight - 1));
 
     float gx = -tl + tr - 2 * ml + 2 * mr - bl + br;
     float gy = -tl - 2 * tc - tr + bl + 2 * bc + br;
@@ -145,6 +228,22 @@ bool IsLocalMaxEdge(int px, int py, float edgeCenter, float2 grad)
     return (edgeCenter + _NmsRelaxation >= mx);
 }
 
+float ComputeBoundaryStrength(float2 p, float2 n)
+{
+    // Mask gecis kuvveti: valid ve invalid taraflarin ayrismasi
+    float a = SampleValidBilinear(p + n * 0.75);
+    float b = SampleValidBilinear(p - n * 0.75);
+    return abs(a - b);
+}
+
+bool IsLocalMaxBoundary(float2 p, float2 n)
+{
+    float c = ComputeBoundaryStrength(p, n);
+    float l = ComputeBoundaryStrength(p - n * 0.5, n);
+    float r = ComputeBoundaryStrength(p + n * 0.5, n);
+    return (c > 0.15) && (c + 0.01 >= max(l, r));
+}
+
 float ComputeSubpixelOffset(float2 p, float2 n)
 {
     float eM = SampleEdgeBilinear(p - n);
@@ -156,6 +255,19 @@ float ComputeSubpixelOffset(float2 p, float2 n)
     // 1D quadratic peak localization
     float t = 0.5 * (eM - eP) / denom;
     return clamp(t, -0.5, 0.5);
+}
+
+float ComputeBoundarySubpixelOffset(float2 p, float2 n)
+{
+    float vM = SampleValidBilinear(p - n);
+    float vP = SampleValidBilinear(p + n);
+    float denom = vP - vM;
+    if (abs(denom) < 1e-6) return 0.0;
+
+    // v(t)=0.5 olan gecis noktasini bul (t in [-1,1]).
+    float u = saturate((0.5 - vM) / denom);
+    float t = u * 2.0 - 1.0;
+    return clamp(t, -0.75, 0.75);
 }
 
 float4 SampleWorldPosBilinearValid(float2 p)
@@ -189,6 +301,43 @@ float4 SampleWorldPosBilinearValid(float2 p)
     return float4(sum / sumW, 1);
 }
 
+float4 StabilizeEdgeWorldPos(float2 subPix, float2 n, float sideSign, float4 baseWp)
+{
+    if (!IsValidPos(baseWp)) return baseWp;
+    if (abs(sideSign) < 0.5) return baseWp;
+
+    float2 t = float2(-n.y, n.x);
+    float3 sum = baseWp.xyz;
+    float sumW = 1.0;
+    float maxJump = max(_InlierThreshold * 4.0, 0.01);
+
+    [unroll]
+    for (int si = 1; si <= 2; si++)
+    {
+        float off = 0.65 * (float)si;
+        float w = 1.0 / (float)(si + 1);
+
+        float2 pA = subPix + t * off + n * (0.45 * sideSign);
+        float2 pB = subPix - t * off + n * (0.45 * sideSign);
+        float4 a = SampleWorldPosBilinearValid(pA);
+        float4 b = SampleWorldPosBilinearValid(pB);
+
+        if (IsValidPos(a) && length(a.xyz - baseWp.xyz) <= maxJump)
+        {
+            sum += a.xyz * w;
+            sumW += w;
+        }
+        if (IsValidPos(b) && length(b.xyz - baseWp.xyz) <= maxJump)
+        {
+            sum += b.xyz * w;
+            sumW += w;
+        }
+    }
+
+    if (sumW <= 1e-6) return baseWp;
+    return float4(sum / sumW, 1);
+}
+
 [numthreads(8, 8, 1)]
 void BuildEdgePositionBuffer(uint3 id : SV_DispatchThreadID)
 {
@@ -197,77 +346,164 @@ void BuildEdgePositionBuffer(uint3 id : SV_DispatchThreadID)
     if (px >= _TexWidth || py >= _TexHeight) return;
 
     float4 outPos = float4(0, 0, 0, 0);
+    float4 centerWp = _WorldPosTex[uint2(px, py)];
     float edge = _EdgeTex[uint2(px, py)].r;
-    if (edge > _MinEdgeThreshold)
+    // Geçici olarak kapali: bu sahnede asiri eleme yapiyor.
+    bool useBoundaryMode = false;
+
+    // Robust silhouette-only path:
+    // BoundaryTransition aktifse raw point sadece world-pos valid mask sinirindan uretilir.
+    if (useBoundaryMode)
     {
-        float2 grad = ComputeEdgeGradient(px, py);
-        if (!IsLocalMaxEdge(px, py, edge, grad))
+        if (!IsValidPos(centerWp))
+        {
+            _RWEdgePosTex[uint2(px, py)] = outPos;
+            return;
+        }
+
+        float2 outward;
+        if (!ComputeBoundaryOutwardDir(px, py, outward))
+        {
+            _RWEdgePosTex[uint2(px, py)] = outPos;
+            return;
+        }
+
+        float2 p = float2((float)px, (float)py);
+        float2 n = outward;
+
+        // Boundary NMS: kalin band yerine tek piksellik ridge.
+        if (!IsLocalMaxBoundary(p, n))
+        {
+            _RWEdgePosTex[uint2(px, py)] = outPos;
+            return;
+        }
+
+        float t = ComputeBoundarySubpixelOffset(p, n);
+        float2 subPix = p + n * t;
+
+        // Objeye dogru hafif geri kaydirip world-pos al.
+        float4 wp = SampleWorldPosBilinearValid(subPix - n * 0.35);
+        if (!IsValidPos(wp)) wp = centerWp;
+        if (!IsValidPos(wp))
+        {
+            _RWEdgePosTex[uint2(px, py)] = outPos;
+            return;
+        }
+
+        wp = StabilizeEdgeWorldPos(subPix - n * 0.35, n, -1.0, wp);
+        if (IsValidPos(wp)) outPos = float4(wp.xyz, 1);
+        _RWEdgePosTex[uint2(px, py)] = outPos;
+        return;
+    }
+
+    if (!useBoundaryMode && edge <= _MinEdgeThreshold)
+    {
+        _RWEdgePosTex[uint2(px, py)] = outPos;
+        return;
+    }
+
+    {
+        float2 grad = useBoundaryMode ? ComputeValidityGradient(px, py) : ComputeEdgeGradient(px, py);
+        float gl = length(grad);
+        if (gl <= 1e-5)
+        {
+            _RWEdgePosTex[uint2(px, py)] = float4(0, 0, 0, 0);
+            return;
+        }
+
+        float2 n = grad / gl;
+        if (useBoundaryMode)
+        {
+            if (!IsLocalMaxBoundary(float2((float)px, (float)py), n))
+            {
+                _RWEdgePosTex[uint2(px, py)] = float4(0, 0, 0, 0);
+                return;
+            }
+        }
+        else if (!IsLocalMaxEdge(px, py, edge, grad))
         {
             _RWEdgePosTex[uint2(px, py)] = float4(0, 0, 0, 0);
             return;
         }
 
         float4 wp = float4(0, 0, 0, 0);
-        float gl = length(grad);
-        if (gl > 1e-5)
+        float sideSign = 0.0;
+        int sx, sy;
+        QuantizedStep(n, sx, sy);
+        float4 side1 = _WorldPosTex[uint2(clamp(px + sx, 0, _TexWidth - 1), clamp(py + sy, 0, _TexHeight - 1))];
+        float4 side2 = _WorldPosTex[uint2(clamp(px - sx, 0, _TexWidth - 1), clamp(py - sy, 0, _TexHeight - 1))];
+        bool v1 = IsValidPos(side1);
+        bool v2 = IsValidPos(side2);
+
+        // Robust boundary lock:
+        // Sadece valid<->invalid gecisinin oldugu pikselleri kabul et.
+        if (useBoundaryMode)
         {
-            float2 n = grad / gl;
-            if (_UseGeomDiscontinuityFilter > 0)
+            if (v1 == v2)
             {
-                int sx, sy;
-                QuantizedStep(n, sx, sy);
-                float4 side1 = _WorldPosTex[uint2(clamp(px + sx, 0, _TexWidth - 1), clamp(py + sy, 0, _TexHeight - 1))];
-                float4 side2 = _WorldPosTex[uint2(clamp(px - sx, 0, _TexWidth - 1), clamp(py - sy, 0, _TexHeight - 1))];
-                bool v1 = IsValidPos(side1);
-                bool v2 = IsValidPos(side2);
+                _RWEdgePosTex[uint2(px, py)] = float4(0, 0, 0, 0);
+                return;
+            }
+            wp = v1 ? side1 : side2;
+            sideSign = v1 ? 1.0 : -1.0;
+        }
+        else
+        {
+            if (v1 && !v2) { wp = side1; sideSign = 1.0; }
+            else if (!v1 && v2) { wp = side2; sideSign = -1.0; }
+        }
 
-                // Her iki taraf da yoksa anlamsiz kenar.
-                if (!v1 && !v2)
-                {
-                    _RWEdgePosTex[uint2(px, py)] = float4(0, 0, 0, 0);
-                    return;
-                }
+        if (_UseGeomDiscontinuityFilter > 0)
+        {
+            // Her iki taraf da yoksa anlamsiz kenar.
+            if (!v1 && !v2)
+            {
+                _RWEdgePosTex[uint2(px, py)] = float4(0, 0, 0, 0);
+                return;
+            }
 
-                // Her iki taraf da var ama geometri farki cok kucukse (smooth/false edge) at.
-                if (v1 && v2)
+            // Her iki taraf da var ama geometri farki cok kucukse (smooth/false edge) at.
+            if (v1 && v2)
+            {
+                float d = length(side1.xyz - side2.xyz);
+                if (d < _MinGeomDiscontinuity)
                 {
-                    float d = length(side1.xyz - side2.xyz);
-                    if (d < _MinGeomDiscontinuity)
+                    // Gercek sinir/oyuk kenarlarinda etrafta gecersiz komsu olur.
+                    // Bu durumda eleme yapma; sadece tam smooth false-edge'leri ele.
+                    bool hasInvalidNbr = HasInvalidWorldNeighbor(px, py);
+                    bool strongEdge = useBoundaryMode ? (gl > 1.35) : (edge > (_MinEdgeThreshold * 1.9));
+                    if (!hasInvalidNbr && !strongEdge)
                     {
-                        // Gercek sinir/oyuk kenarlarinda etrafta gecersiz komsu olur.
-                        // Bu durumda eleme yapma; sadece tam smooth false-edge'leri ele.
-                        bool hasInvalidNbr = HasInvalidWorldNeighbor(px, py);
-                        bool strongEdge = edge > (_MinEdgeThreshold * 1.9);
-                        if (!hasInvalidNbr && !strongEdge)
-                        {
-                            _RWEdgePosTex[uint2(px, py)] = float4(0, 0, 0, 0);
-                            return;
-                        }
+                        _RWEdgePosTex[uint2(px, py)] = float4(0, 0, 0, 0);
+                        return;
                     }
                 }
             }
-
-            float2 p = float2((float)px, (float)py);
-            float t = ComputeSubpixelOffset(p, n);
-            float2 subPix = p + n * t;
-
-            wp = SampleWorldPosBilinearValid(subPix);
-            if (!IsValidPos(wp))
-            {
-                int ox1 = clamp(px + (int)(n.x * OFFSET), 0, _TexWidth - 1);
-                int oy1 = clamp(py + (int)(n.y * OFFSET), 0, _TexHeight - 1);
-                int ox2 = clamp(px - (int)(n.x * OFFSET), 0, _TexWidth - 1);
-                int oy2 = clamp(py - (int)(n.y * OFFSET), 0, _TexHeight - 1);
-                float4 w1 = _WorldPosTex[uint2(ox1, oy1)];
-                float4 w2 = _WorldPosTex[uint2(ox2, oy2)];
-                bool v1 = IsValidPos(w1);
-                bool v2 = IsValidPos(w2);
-                if (v1 && !v2) wp = w1;
-                else if (!v1 && v2) wp = w2;
-                else if (v1) wp = w1;
-                else if (v2) wp = w2;
-            }
         }
+
+        float2 p = float2((float)px, (float)py);
+        float t = useBoundaryMode ? ComputeBoundarySubpixelOffset(p, n) : ComputeSubpixelOffset(p, n);
+        float2 subPix = p + n * t;
+
+        if (!IsValidPos(wp))
+            wp = SampleWorldPosBilinearValid(subPix);
+        if (!IsValidPos(wp))
+        {
+            int ox1 = clamp(px + (int)(n.x * OFFSET), 0, _TexWidth - 1);
+            int oy1 = clamp(py + (int)(n.y * OFFSET), 0, _TexHeight - 1);
+            int ox2 = clamp(px - (int)(n.x * OFFSET), 0, _TexWidth - 1);
+            int oy2 = clamp(py - (int)(n.y * OFFSET), 0, _TexHeight - 1);
+            float4 w1 = _WorldPosTex[uint2(ox1, oy1)];
+            float4 w2 = _WorldPosTex[uint2(ox2, oy2)];
+            bool fw1 = IsValidPos(w1);
+            bool fw2 = IsValidPos(w2);
+            if (fw1 && !fw2) { wp = w1; sideSign = 1.0; }
+            else if (!fw1 && fw2) { wp = w2; sideSign = -1.0; }
+            else if (fw1) { wp = w1; if (abs(sideSign) < 0.5) sideSign = 1.0; }
+            else if (fw2) { wp = w2; if (abs(sideSign) < 0.5) sideSign = -1.0; }
+        }
+
+        wp = StabilizeEdgeWorldPos(subPix, n, sideSign, wp);
         if (!IsValidPos(wp)) wp = _WorldPosTex[uint2(px, py)];
         if (IsValidPos(wp)) outPos = float4(wp.xyz, 1);
     }
@@ -285,6 +521,7 @@ void FitMicroLines(uint3 id : SV_DispatchThreadID)
     if (startX >= _TexWidth || startY >= _TexHeight) return;
 
     float3 pts3d[MAX_PTS];
+    float2 pts2d[MAX_PTS];
     int cnt = 0;
     for (int py = startY; py < endY; py++)
     {
@@ -293,12 +530,122 @@ void FitMicroLines(uint3 id : SV_DispatchThreadID)
             float4 ep = _EdgePosTex[uint2(px, py)];
             if (ep.w <= 0) continue;
             pts3d[cnt] = ep.xyz;
+            pts2d[cnt] = float2((float)px, (float)py);
             cnt++;
             if (cnt >= MAX_PTS) break;
         }
         if (cnt >= MAX_PTS) break;
     }
     if (cnt < _MinPointsForLine) return;
+
+    // Debug modda filtrelerden once ham edge-position noktalarini goster.
+    if (_DebugMode > 0)
+    {
+        for (int di = 0; di < cnt; di++)
+        {
+            MicroLine pt;
+            pt.sx = pts3d[di].x; pt.sy = pts3d[di].y; pt.sz = pts3d[di].z;
+            pt.ex = pts3d[di].x; pt.ey = pts3d[di].y; pt.ez = pts3d[di].z;
+            _DebugPoints.Append(pt);
+        }
+        return;
+    }
+
+    // 2D dominant-band filter:
+    // Tile icinde birden fazla paralel edge kolu varsa (zigzag/ikiz edge),
+    // en yogun banda yakin noktalar tutulur.
+    {
+        float2 mean2 = float2(0, 0);
+        for (int i = 0; i < cnt; i++) mean2 += pts2d[i];
+        mean2 /= (float)cnt;
+
+        float c11 = 0, c12 = 0, c22 = 0;
+        for (int i = 0; i < cnt; i++)
+        {
+            float2 d = pts2d[i] - mean2;
+            c11 += d.x * d.x;
+            c12 += d.x * d.y;
+            c22 += d.y * d.y;
+        }
+
+        float2 t2 = float2(1, 0);
+        [unroll]
+        for (int it = 0; it < 6; it++)
+        {
+            float2 Ct = float2(
+                c11 * t2.x + c12 * t2.y,
+                c12 * t2.x + c22 * t2.y
+            );
+            float l = length(Ct);
+            if (l > 1e-6) t2 = Ct / l;
+        }
+        float2 n2 = float2(-t2.y, t2.x);
+
+        float dMin = 1e20, dMax = -1e20;
+        float dist[MAX_PTS];
+        for (int i = 0; i < cnt; i++)
+        {
+            float di = dot(pts2d[i] - mean2, n2);
+            dist[i] = di;
+            dMin = min(dMin, di);
+            dMax = max(dMax, di);
+        }
+
+        float dRange = dMax - dMin;
+        if (dRange > 1e-4)
+        {
+            const int BINS = 8;
+            int hist[BINS];
+            [unroll] for (int b = 0; b < BINS; b++) hist[b] = 0;
+
+            float inv = 1.0 / dRange;
+            for (int i = 0; i < cnt; i++)
+            {
+                float dn = saturate((dist[i] - dMin) * inv);
+                int b = min((int)(dn * (float)BINS), BINS - 1);
+                hist[b]++;
+            }
+
+            int bestB = 0;
+            int bestC = hist[0];
+            [unroll]
+            for (int b = 1; b < BINS; b++)
+            {
+                if (hist[b] > bestC) { bestC = hist[b]; bestB = b; }
+            }
+
+            float bandSize = dRange / (float)BINS;
+            float center = dMin + ((float)bestB + 0.5) * bandSize;
+            float band = max(bandSize * 0.90, 0.75); // daha dar band: paralel ikinci kolu azalt
+            float domRatio = (float)bestC / (float)cnt;
+
+            if (domRatio >= 0.48)
+            {
+                float3 keep3[MAX_PTS];
+                float2 keep2[MAX_PTS];
+                int keep = 0;
+                for (int i = 0; i < cnt; i++)
+                {
+                    if (abs(dist[i] - center) <= band)
+                    {
+                        keep3[keep] = pts3d[i];
+                        keep2[keep] = pts2d[i];
+                        keep++;
+                    }
+                }
+
+                if (keep >= max(_MinPointsForLine, 4))
+                {
+                    cnt = keep;
+                    for (int i = 0; i < cnt; i++)
+                    {
+                        pts3d[i] = keep3[i];
+                        pts2d[i] = keep2[i];
+                    }
+                }
+            }
+        }
+    }
 
     // Z-band outlier suppression:
     // Duz kisimlarda tutarli olan Z kumesini secip digerlerini eler.
@@ -345,39 +692,157 @@ void FitMicroLines(uint3 id : SV_DispatchThreadID)
             float zBand = max(binSize * 0.9, 0.0025);
             float dominantRatio = (float)bestCountBin / (float)cnt;
 
-            float3 tmpPts[MAX_PTS];
+            float3 tmpPts3[MAX_PTS];
+            float2 tmpPts2[MAX_PTS];
             int keep = 0;
             for (int zi = 0; zi < cnt; zi++)
             {
                 if (abs(pts3d[zi].z - zCenter) <= zBand)
                 {
-                    tmpPts[keep] = pts3d[zi];
+                    tmpPts3[keep] = pts3d[zi];
+                    tmpPts2[keep] = pts2d[zi];
                     keep++;
                 }
             }
 
             // Z-band sadece gerçekten baskin bir mode varsa uygula.
             // Aksi halde (egri/oval bölgeler) gereksiz kopukluk olusturabiliyor.
-            bool strongDominant = dominantRatio >= 0.58;
+            bool strongDominant = dominantRatio >= 0.62;
             bool enoughRange = zRange > max(_InlierThreshold * 2.0, 0.004);
             if (strongDominant && enoughRange && keep >= max(_MinPointsForLine, 4))
             {
                 cnt = keep;
-                for (int zi = 0; zi < cnt; zi++) pts3d[zi] = tmpPts[zi];
+                for (int zi = 0; zi < cnt; zi++)
+                {
+                    pts3d[zi] = tmpPts3[zi];
+                    pts2d[zi] = tmpPts2[zi];
+                }
             }
         }
     }
 
-    if (_DebugMode > 0)
+    // Local density outlier suppression:
+    // Cizgi bandindan kopuk, tek tük kalan noktalar silinir.
     {
-        for (int di = 0; di < cnt; di++)
+        float3 keep3[MAX_PTS];
+        float2 keep2[MAX_PTS];
+        int keep = 0;
+
+        float neighRadSq = 5.0; // ~2.2px
+        float zTol = max(_InlierThreshold * 2.5, 0.003);
+        int minSupport = (cnt >= 8) ? 2 : 1;
+
+        for (int i = 0; i < cnt; i++)
         {
-            MicroLine pt;
-            pt.sx = pts3d[di].x; pt.sy = pts3d[di].y; pt.sz = pts3d[di].z;
-            pt.ex = pts3d[di].x; pt.ey = pts3d[di].y; pt.ez = pts3d[di].z;
-            _DebugPoints.Append(pt);
+            int support = 0;
+            for (int j = 0; j < cnt; j++)
+            {
+                if (j == i) continue;
+                float2 d2 = pts2d[j] - pts2d[i];
+                if (dot(d2, d2) > neighRadSq) continue;
+                if (abs(pts3d[j].z - pts3d[i].z) > zTol) continue;
+                support++;
+            }
+
+            if (support >= minSupport)
+            {
+                keep3[keep] = pts3d[i];
+                keep2[keep] = pts2d[i];
+                keep++;
+            }
         }
-        return;
+
+        if (keep >= max(_MinPointsForLine, 4))
+        {
+            cnt = keep;
+            for (int i = 0; i < cnt; i++)
+            {
+                pts3d[i] = keep3[i];
+                pts2d[i] = keep2[i];
+            }
+        }
+    }
+
+    // 2D pre-RANSAC dominant-line gating:
+    // 3D RANSAC'tan once, ekran uzayinda tek baskin cizgiye yakin noktalar tutulur.
+    // Bu adim, sarp/egri bolgelerdeki daginik outlier'lari robust sekilde temizler.
+    {
+        if (cnt >= max(_MinPointsForLine, 5))
+        {
+            uint seed2D = WangHash(id.x * 73856093u + id.y * 19349663u + _FrameSeed * 83492791u + 17u);
+            int bestCount2D = 0;
+            int bestI12D = 0;
+            int bestI22D = 1;
+            int iter2D = min(64, (int)((uint)cnt * ((uint)cnt - 1u) / 2u));
+            float pxTh = 0.95; // daha sıkı 2D inlier bandı
+
+            for (int it2 = 0; it2 < iter2D; it2++)
+            {
+                seed2D = WangHash(seed2D);
+                int i1 = seed2D % (uint)cnt;
+                seed2D = WangHash(seed2D);
+                int i2 = seed2D % (uint)cnt;
+                if (i1 == i2) continue;
+
+                float2 a2 = pts2d[i1];
+                float2 b2 = pts2d[i2];
+                float2 d2 = b2 - a2;
+                float len2 = length(d2);
+                if (len2 < 1e-4) continue;
+
+                int in2 = 0;
+                for (int j = 0; j < cnt; j++)
+                {
+                    float2 ap = pts2d[j] - a2;
+                    float cross2 = abs(ap.x * d2.y - ap.y * d2.x);
+                    float dist = cross2 / len2;
+                    if (dist <= pxTh) in2++;
+                }
+
+                if (in2 > bestCount2D)
+                {
+                    bestCount2D = in2;
+                    bestI12D = i1;
+                    bestI22D = i2;
+                }
+            }
+
+            if (bestCount2D >= max(_MinPointsForLine, 5))
+            {
+                float2 a2 = pts2d[bestI12D];
+                float2 b2 = pts2d[bestI22D];
+                float2 d2 = b2 - a2;
+                float len2 = length(d2);
+                if (len2 > 1e-4)
+                {
+                    float3 keep3[MAX_PTS];
+                    float2 keep2[MAX_PTS];
+                    int keep = 0;
+                    for (int j = 0; j < cnt; j++)
+                    {
+                        float2 ap = pts2d[j] - a2;
+                        float cross2 = abs(ap.x * d2.y - ap.y * d2.x);
+                        float dist = cross2 / len2;
+                        if (dist <= pxTh)
+                        {
+                            keep3[keep] = pts3d[j];
+                            keep2[keep] = pts2d[j];
+                            keep++;
+                        }
+                    }
+
+                    if (keep >= max(_MinPointsForLine, 4))
+                    {
+                        cnt = keep;
+                        for (int j = 0; j < cnt; j++)
+                        {
+                            pts3d[j] = keep3[j];
+                            pts2d[j] = keep2[j];
+                        }
+                    }
+                }
+            }
+        }
     }
 
     float thSq3D = _InlierThreshold * _InlierThreshold;

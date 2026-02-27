@@ -550,7 +550,7 @@ Transform:
   m_GameObject: {fileID: 961929562}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 2.8, y: 0.35, z: -7.41}
+  m_LocalPosition: {x: 2.5, y: 0.35, z: -7.41}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -665,8 +665,6 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::SceneCapture.EdgeDetectionEffect
   method: 0
   source: 3
-  useDepthForLineFitting: 1
-  lineEdgeThreshold: 0.08
   edgeThreshold: 0.25
   edgeColor: {r: 1, g: 1, b: 1, a: 1}
   backgroundColor: {r: 0, g: 0, b: 0, a: 1}
@@ -677,6 +675,9 @@ MonoBehaviour:
   maxDepth: 50
   normalSensitivity: 10
   minCreaseAngleDeg: 26
+  useAlgorithmSupersampling: 1
+  algorithmSupersampleScale: 2
+  algorithmSmoothPasses: 1
   invertOutput: 0
 --- !u!114 &963194232
 MonoBehaviour:
@@ -739,29 +740,27 @@ MonoBehaviour:
   microLineCS: {fileID: 7200000, guid: 0947c1e8888d4ea46bbbddbef0ec7809, type: 3}
   updateInterval: 0.01
   minEdgeLuminance: 0.1
+  nmsRelaxation: 0.008
+  useGeomDiscontinuityFilter: 1
+  minGeomDiscontinuity: 0.006
+  requireBoundaryTransition: 0
   kernelSize: 5
   minPointsForLine: 4
   inlierThreshold: 0.08
   maxSegmentLength: 0.5
+  autoScaleKernelWithResolution: 1
+  referenceHeight: 1080
+  kernelScaleExponent: 1
+  autoScaleMinPointsForLine: 1
+  minPointAreaRatio: 0.08
+  maxAutoMinPoints: 14
+  minInlierRatio: 0.52
+  minLinearityFactor: 1.5
   showLines: 1
   visualLineThickness: 4
-  usePostRegularization: 0
-  regularizeLineDirections: 0
-  regularizationAngleDeg: 18
-  regularizationMinLength: 0.01
-  removeDirectionOutliers: 0
-  outlierAngleDeg: 28
-  stabilizeLineCenter: 0
-  centerSnapStrength: 0.85
-  maxLateralDistance: 0.04
-  collapseToSingleDominantLine: 0
-  robustDirectionFit: 0
-  robustDirectionInlierAngleDeg: 18
-  showPointCloud: 0
-  pointCloudColor: {r: 0, g: 1, b: 0, a: 1}
-  pointSize: 0.01
   showRawEdgePoints: 0
   rawPointColor: {r: 0, g: 1, b: 1, a: 1}
+  rawPointSize: 0.01
   showPerformance: 1
   _algorithmMs: 0
   _readbackMs: 0

@@ -36,6 +36,7 @@ Shader "Custom/EdgeDetection"
         // 1 = magnitude değerini doğrudan çıkar (thinning pass için)
         // 0 = binary threshold uygula (final output için)
         [Toggle] _OutputMagnitude ("Output Raw Magnitude", Float) = 0
+        _MagnitudeScale ("Magnitude Scale (raw output)", Range(0.5, 4.0)) = 1.0
 
         // Crease filtresi: Bu değerin ÜSTÜNDE dot product → açı çok küçük → smooth yüzey → edge sayma
         // Örnek: 0.94 ≈ cos(20°), 0.87 ≈ cos(30°), 0.71 ≈ cos(45°)
@@ -88,6 +89,7 @@ Shader "Custom/EdgeDetection"
             float _ColorWeight;
             float _InvertOutput;
             float _OutputMagnitude;  // YENİ
+            float _MagnitudeScale;
             float _MinCreaseDot;     // Crease filtresi: bu dot değerinden BÜYÜK açılar edge sayılmaz
             
             v2f vert (appdata v)
@@ -283,7 +285,7 @@ Shader "Custom/EdgeDetection"
                 {
                     // Thinning pass için: raw magnitude değerini çıkar
                     // Normalize et ki 0-1 aralığında kalsın
-                    float normalizedMag = saturate(mag);
+                    float normalizedMag = saturate(mag * _MagnitudeScale);
                     return fixed4(normalizedMag, normalizedMag, normalizedMag, 1);
                 }
                 

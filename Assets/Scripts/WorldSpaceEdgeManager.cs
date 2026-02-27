@@ -42,6 +42,8 @@ namespace SceneCapture.Edge3D
         [Tooltip("Smooth/false edge'leri geometri farkina gore bastirir.")]
         public bool useGeomDiscontinuityFilter = true;
         [Range(0.0005f, 0.05f)] public float minGeomDiscontinuity = 0.006f;
+        [Tooltip("Raw point'i sadece world-pos valid/invalid sinir gecisinde uretir (en robust mod).")]
+        public bool requireBoundaryTransition = false;
 
         [Header("RANSAC (Kernel)")]
         public KernelSizeOption kernelSize = KernelSizeOption._5x5;
@@ -219,6 +221,7 @@ namespace SceneCapture.Edge3D
             microLineCS.SetFloat("_MinEdgeThreshold", minEdgeLuminance);
             microLineCS.SetFloat("_NmsRelaxation", nmsRelaxation);
             microLineCS.SetInt("_UseGeomDiscontinuityFilter", useGeomDiscontinuityFilter ? 1 : 0);
+            microLineCS.SetInt("_RequireBoundaryTransition", requireBoundaryTransition ? 1 : 0);
             float geomScale = Mathf.Pow(Mathf.Max(0.1f, (float)referenceHeight / Mathf.Max(1f, Screen.height)), 0.35f);
             float effectiveGeomDisc = minGeomDiscontinuity * geomScale;
             microLineCS.SetFloat("_MinGeomDiscontinuity", effectiveGeomDisc);
