@@ -381,7 +381,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::SceneCapture.EdgeDetectionEffect
   method: 0
-  source: 3
+  source: 1
   edgeThreshold: 0.25
   edgeColor: {r: 1, g: 1, b: 1, a: 1}
   backgroundColor: {r: 0, g: 0, b: 0, a: 1}
@@ -392,6 +392,10 @@ MonoBehaviour:
   maxDepth: 50
   normalSensitivity: 10
   minCreaseAngleDeg: 26
+  useAlgorithmSupersampling: 1
+  algorithmSupersampleScale: 2
+  algorithmSmoothPasses: 1
+  algorithmMagnitudeScale: 1.6
   invertOutput: 0
 --- !u!114 &963194232
 MonoBehaviour:
@@ -457,6 +461,7 @@ MonoBehaviour:
   nmsRelaxation: 0.008
   useGeomDiscontinuityFilter: 1
   minGeomDiscontinuity: 0.006
+  requireBoundaryTransition: 0
   kernelSize: 5
   minPointsForLine: 2
   inlierThreshold: 0.08

@@ -15,7 +15,7 @@ Shader "Custom/EdgeDetection"
         [KeywordEnum(Sobel, Roberts, Prewitt)] 
         _Method ("Detection Method", Float) = 0
         
-        [KeywordEnum(Luminance, Depth, Normal, Combined)]
+        [KeywordEnum(Luminance, Depth, Normal, Combined, Hybrid)]
         _Source ("Edge Source", Float) = 0
         
         // Derinlik ayarları
@@ -42,6 +42,9 @@ Shader "Custom/EdgeDetection"
         // Örnek: 0.94 ≈ cos(20°), 0.87 ≈ cos(30°), 0.71 ≈ cos(45°)
         // Sphere/capsule mesh edge'leri (~10-20°) bastırmak için: 0.90-0.95
         _MinCreaseDot ("Min Crease Dot (smooth=1, sharp=0)", Range(0, 1)) = 0.9
+        _HybridNormalBoost ("Hybrid Normal Boost", Range(0, 2)) = 1.25
+        _HybridCreaseStart ("Hybrid Crease Start", Range(0, 1)) = 0.05
+        _HybridCreaseEnd ("Hybrid Crease End", Range(0, 1)) = 0.20
     }
     
     SubShader
@@ -56,7 +59,7 @@ Shader "Custom/EdgeDetection"
             #pragma fragment frag
             
             #pragma multi_compile _METHOD_SOBEL _METHOD_ROBERTS _METHOD_PREWITT
-            #pragma multi_compile _SOURCE_LUMINANCE _SOURCE_DEPTH _SOURCE_NORMAL _SOURCE_COMBINED
+            #pragma multi_compile _SOURCE_LUMINANCE _SOURCE_DEPTH _SOURCE_NORMAL _SOURCE_COMBINED _SOURCE_HYBRID
             
             #include "UnityCG.cginc"
             
@@ -91,6 +94,9 @@ Shader "Custom/EdgeDetection"
             float _OutputMagnitude;  // YENİ
             float _MagnitudeScale;
             float _MinCreaseDot;     // Crease filtresi: bu dot değerinden BÜYÜK açılar edge sayılmaz
+            float _HybridNormalBoost;
+            float _HybridCreaseStart;
+            float _HybridCreaseEnd;
             
             v2f vert (appdata v)
             {
@@ -189,9 +195,12 @@ Shader "Custom/EdgeDetection"
                 return float2(gx, gy);
             }
 
-            float GetCombinedEdge(float2 uv, float2 t)
+            void GetEdgeComponents(float2 uv, float2 t, out float depthEdge, out float normalEdge, out float colorEdge, out float localSharpness)
             {
-                float edge = 0;
+                depthEdge = 0;
+                normalEdge = 0;
+                colorEdge = 0;
+                localSharpness = 0;
                 
                 // RENK KENARLARI (Sobel on Luminance)
                 if (_ColorWeight > 0.01)
@@ -208,7 +217,7 @@ Shader "Custom/EdgeDetection"
                     float gx = -tl - 2.0*ml - bl + tr + 2.0*mr + br;
                     float gy = -tl - 2.0*tm - tr + bl + 2.0*bm + br;
                     
-                    edge += sqrt(gx*gx + gy*gy) * _ColorWeight;
+                    colorEdge = sqrt(gx*gx + gy*gy) * _ColorWeight;
                 }
                 
                 // DERİNLİK KENARLARI
@@ -221,7 +230,7 @@ Shader "Custom/EdgeDetection"
                     float dr = SampleDepth(uv + float2(t.x, 0));
                     
                     float de = abs(dc-dt) + abs(dc-db) + abs(dc-dl) + abs(dc-dr);
-                    edge += de * _DepthSensitivity * _DepthWeight;
+                    depthEdge = de * _DepthSensitivity * _DepthWeight;
                 }
                 
                 // NORMAL KENARLARI
@@ -238,6 +247,11 @@ Shader "Custom/EdgeDetection"
                     float dotB = saturate(dot(nc, nb));
                     float dotL = saturate(dot(nc, nl));
                     float dotR = saturate(dot(nc, nr));
+                    float sharpT = 1.0 - dotT;
+                    float sharpB = 1.0 - dotB;
+                    float sharpL = 1.0 - dotL;
+                    float sharpR = 1.0 - dotR;
+                    localSharpness = max(max(sharpT, sharpB), max(sharpL, sharpR));
 
                     float ne = 0;
                     // CREASE FİLTRESİ: Yalnızca açı _MinCreaseDot eşiğini GEÇEN kenarlara bak.
@@ -248,10 +262,30 @@ Shader "Custom/EdgeDetection"
                     if (dotL < _MinCreaseDot) ne += pow(1.0 - dotL, 2);
                     if (dotR < _MinCreaseDot) ne += pow(1.0 - dotR, 2);
 
-                    edge += ne * _NormalSensitivity * _NormalWeight;
+                    normalEdge = ne * _NormalSensitivity * _NormalWeight;
                 }
-                
-                return edge;
+            }
+
+            float GetCombinedEdge(float2 uv, float2 t)
+            {
+                float depthEdge, normalEdge, colorEdge, localSharpness;
+                GetEdgeComponents(uv, t, depthEdge, normalEdge, colorEdge, localSharpness);
+                return depthEdge + normalEdge + colorEdge;
+            }
+
+            float GetHybridEdge(float2 uv, float2 t)
+            {
+                float depthEdge, normalEdge, colorEdge, localSharpness;
+                GetEdgeComponents(uv, t, depthEdge, normalEdge, colorEdge, localSharpness);
+
+                float denom = max(1e-4, _HybridCreaseEnd - _HybridCreaseStart);
+                float creaseMask = saturate((localSharpness - _HybridCreaseStart) / denom);
+                creaseMask = smoothstep(0.0, 1.0, creaseMask);
+
+                // Smooth/curved bölgede depth öncelikli; keskin bölgede combined katkısı artar.
+                float hybridNormal = normalEdge * lerp(0.0, _HybridNormalBoost, creaseMask);
+                float hybridColor  = colorEdge * creaseMask;
+                return depthEdge + hybridNormal + hybridColor;
             }
             
             fixed4 frag (v2f i) : SV_Target
@@ -262,6 +296,8 @@ Shader "Custom/EdgeDetection"
                 
                 #if _SOURCE_COMBINED
                     mag = GetCombinedEdge(i.uv, t);
+                #elif _SOURCE_HYBRID
+                    mag = GetHybridEdge(i.uv, t);
                 #else
                     #if _METHOD_SOBEL
                         float2 g = Sobel(i.uv, t);

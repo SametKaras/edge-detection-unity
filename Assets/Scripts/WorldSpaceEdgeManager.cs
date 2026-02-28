@@ -14,7 +14,13 @@ namespace SceneCapture.Edge3D
         _3x3 = 3,
         _5x5 = 5,
         _7x7 = 7,
-        _9x9 = 9
+        _9x9 = 9,
+        _11x11 = 11,
+        _13x13 = 13,
+        _15x15 = 15,
+        _17x17 = 17,
+        _19x19 = 19,
+        _21x21 = 21
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -64,10 +70,17 @@ namespace SceneCapture.Edge3D
         [Header("Line Quality Filters")]
         [Range(0.3f, 0.8f)] public float minInlierRatio = 0.52f;
         [Range(1.0f, 3.0f)] public float minLinearityFactor = 1.5f;
+        
+        [Header("Stability")]
+        [Tooltip("Aynı sahnede frame'den frame'e line zıplamasını azaltmak için sabit seed kullan.")]
+        public bool useStableSeed = true;
+        public int stableSeedValue = 1337;
 
         [Header("Visualization")]
         public bool showLines = true;
         [Range(1f, 15f)] public float visualLineThickness = 4.0f;
+        [Tooltip("CPU tarafinda cizilecek/okunacak maksimum line sayisi. Sahnede gorunen toplam edge line'i sinirlar.")]
+        [Range(100, 5000)] public int maxOutputLines = 5000;
 
         [Header("Debug: Raw Edge Points")]
         [Tooltip("Edge piksellerinin ham 3D pozisyonlarını gösterir (RANSAC öncesi)")]
@@ -166,7 +179,9 @@ namespace SceneCapture.Edge3D
             float ratio = Mathf.Max(0.1f, (float)Screen.height / safeRef);
             float scale = Mathf.Pow(ratio, kernelScaleExponent);
             int k = Mathf.RoundToInt(baseK * scale);
-            k = Mathf.Clamp(k, 3, 31);
+            // Compute shader'da tile icinde toplanan nokta sayisi sinirli (MAX_PTS).
+            // MAX_PTS=441 ile 21x21'e kadar guvenli.
+            k = Mathf.Clamp(k, 3, 21);
             if ((k & 1) == 0) k += 1; // kernel tek olmali
             return k;
         }
@@ -236,7 +251,7 @@ namespace SceneCapture.Edge3D
             microLineCS.SetInt("_TexWidth", Screen.width);
             microLineCS.SetInt("_TexHeight", Screen.height);
             microLineCS.SetBuffer(fitKernel, "_OutputLines", _lineBuffer);
-            microLineCS.SetInt("_FrameSeed", Time.frameCount);
+            microLineCS.SetInt("_FrameSeed", useStableSeed ? stableSeedValue : Time.frameCount);
 
             // Debug mode
             if (_debugBuffer != null)
@@ -294,7 +309,8 @@ namespace SceneCapture.Edge3D
                 }
 
                 var countData = _countReq.GetData<int>();
-                _pendingLineCount = Mathf.Min(countData[0], MAX_LINES);
+                int safeCap = Mathf.Clamp(maxOutputLines, 1, MAX_LINES);
+                _pendingLineCount = Mathf.Min(countData[0], safeCap);
 
                 if (_pendingLineCount > 0)
                 {

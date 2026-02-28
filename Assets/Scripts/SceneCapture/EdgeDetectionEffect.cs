@@ -23,6 +23,14 @@ namespace SceneCapture
         [Range(0f, 1f)] public float depthWeight = 1.0f;   // Derinlik kenarları (Kritik)
         [Range(0f, 1f)] public float normalWeight = 1.0f;  // Köşe kenarları (Kritik)
         [Range(0f, 1f)] public float colorWeight = 0.0f;   // KAPATILDI (Gölge sorunu yaratır)
+
+        [Header("Hybrid Source (Depth + Adaptive Combined)")]
+        [Tooltip("Hybrid modda crease bolgelerinde normal katkisini kuvvetlendirir.")]
+        [Range(0f, 2f)] public float hybridNormalBoost = 1.25f;
+        [Tooltip("Hybrid modda crease maskesinin baslangic noktasi (1-dot uzayinda).")]
+        [Range(0f, 1f)] public float hybridCreaseStart = 0.05f;
+        [Tooltip("Hybrid modda crease maskesinin tam acildigi nokta (1-dot uzayinda).")]
+        [Range(0f, 1f)] public float hybridCreaseEnd = 0.20f;
         
         [Header("Sensitivity")]
         [Range(0.1f, 100f)] public float depthSensitivity = 10f;
@@ -47,7 +55,7 @@ namespace SceneCapture
         public bool invertOutput = false;
         
         public enum EdgeMethod { Sobel, Roberts, Prewitt }
-        public enum EdgeSource { Luminance, Depth, Normal, Combined }
+        public enum EdgeSource { Luminance, Depth, Normal, Combined, Hybrid }
         
         public RenderTexture EdgeResultTexture => _edgeResultTexture;
 
@@ -57,7 +65,7 @@ namespace SceneCapture
         private RenderTexture _algorithmEdgeRT;
         
         private static readonly string[] MethodKeywords = { "_METHOD_SOBEL", "_METHOD_ROBERTS", "_METHOD_PREWITT" };
-        private static readonly string[] SourceKeywords = { "_SOURCE_LUMINANCE", "_SOURCE_DEPTH", "_SOURCE_NORMAL", "_SOURCE_COMBINED" };
+        private static readonly string[] SourceKeywords = { "_SOURCE_LUMINANCE", "_SOURCE_DEPTH", "_SOURCE_NORMAL", "_SOURCE_COMBINED", "_SOURCE_HYBRID" };
 
         void OnEnable()
         {
@@ -104,6 +112,9 @@ namespace SceneCapture
             _material.SetFloat("_DepthWeight", depthWeight);
             _material.SetFloat("_NormalWeight", normalWeight);
             _material.SetFloat("_ColorWeight", colorWeight);
+            _material.SetFloat("_HybridNormalBoost", hybridNormalBoost);
+            _material.SetFloat("_HybridCreaseStart", hybridCreaseStart);
+            _material.SetFloat("_HybridCreaseEnd", Mathf.Max(hybridCreaseStart + 0.001f, hybridCreaseEnd));
             // Crease filtresi: derece → cos(açı) dönüşümü (shader dot product ile karşılaştırır)
             _material.SetFloat("_MinCreaseDot", Mathf.Cos(minCreaseAngleDeg * Mathf.Deg2Rad));
             
