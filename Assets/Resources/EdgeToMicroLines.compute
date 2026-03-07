@@ -1,738 +1,395 @@
-// EdgeToMicroLines.compute (refactored / compact)
-// Amaç:
-// 1) Edge magnitude + world position'dan stabil 3D edge point üretmek
-// 2) Tile bazında 3D RANSAC + PCA ile micro-line çıkarmak
+// ============================================================
+// EdgeToMicroLines.compute (STABİL VE KUSURSUZ SÜRÜM)
+// ============================================================
 
 #pragma kernel BuildEdgePositionBuffer
 #pragma kernel FitMicroLines
 
-#define MAX_PTS 441 // 21x21
+#define MAX_PTS    441     
+#define PCA_ITER   6       
+#define PCA_ITER3D 8       
+#define RANSAC_ITER 72     
+#define HIST_BINS  12      
+#define OCC_BINS   14      
 
-Texture2D<float4> _EdgeTex;
-Texture2D<float4> _WorldPosTex;
-Texture2D<float4> _EdgePosTex;
-RWTexture2D<float4> _RWEdgePosTex;
+Texture2D<float>    _EdgeTex;       
+Texture2D<float4>   _WorldPosTex;   
+Texture2D<float4>   _NormalTex;     
+Texture2D<float4>   _EdgePosTex;    
+RWTexture2D<float4> _RWEdgePosTex;  
 
-struct MicroLine
-{
-    float sx, sy, sz;
-    float ex, ey, ez;
-};
+struct MicroLine { float sx, sy, sz; float ex, ey, ez; };
 
 AppendStructuredBuffer<MicroLine> _OutputLines;
 AppendStructuredBuffer<MicroLine> _DebugPoints;
 
-int   _KernelSize;
-float _MinEdgeThreshold;
-float _NmsRelaxation;
+int   _KernelSize;              
+float _MinEdgeThreshold;        
+float _NmsRelaxation;           
 int   _UseGeomDiscontinuityFilter;
-float _MinGeomDiscontinuity;
+float _MinGeomDiscontinuity;    
 int   _RequireBoundaryTransition;
-int   _MinPointsForLine;
-float _MinInlierRatio;
-float _MinLinearityFactor;
-float _InlierThreshold;
-float _MaxSegLength;
+int   _MinPointsForLine;        
+float _MinEdgePointRatio;       
+float _MinInlierRatio;          
+float _MinLinearityFactor;      
+float _InlierThreshold;         
+float _MaxSegLength;            
+float _NormalDotThreshold;      
 int   _TexWidth;
 int   _TexHeight;
 uint  _FrameSeed;
 int   _DebugMode;
+float3   _CameraWorldPos;       
 
-uint WangHash(uint seed)
-{
-    seed = (seed ^ 61u) ^ (seed >> 16u);
-    seed *= 9u;
-    seed = seed ^ (seed >> 4u);
-    seed *= 0x27d4eb2du;
-    seed = seed ^ (seed >> 15u);
-    return seed;
+uint WangHash(uint seed) {
+    seed = (seed ^ 61u) ^ (seed >> 16u); seed *= 9u;
+    seed = seed ^ (seed >> 4u); seed *= 0x27d4eb2du;
+    seed = seed ^ (seed >> 15u); return seed;
 }
 
-bool IsValidPos(float4 p)
-{
-    return p.w > 0.5;
+bool IsValidPos(float4 p) { return p.w > 0.5; }
+int2 ClampPx(int2 p) { return int2(clamp(p.x, 0, _TexWidth - 1), clamp(p.y, 0, _TexHeight - 1)); }
+float LoadEdge(int2 p) { return _EdgeTex[ClampPx(p)].r; }
+float4 LoadWorld(int2 p) { return _WorldPosTex[ClampPx(p)]; }
+
+float2 EdgeGradSobel(int px, int py) {
+    float tl = LoadEdge(int2(px - 1, py - 1)); float tc = LoadEdge(int2(px, py - 1)); float tr = LoadEdge(int2(px + 1, py - 1));
+    float ml = LoadEdge(int2(px - 1, py)); float mr = LoadEdge(int2(px + 1, py));
+    float bl = LoadEdge(int2(px - 1, py + 1)); float bc = LoadEdge(int2(px, py + 1)); float br = LoadEdge(int2(px + 1, py + 1));
+    return float2(-tl + tr - 2.0*ml + 2.0*mr - bl + br, -tl - 2.0*tc - tr + bl + 2.0*bc + br);
 }
 
-int2 ClampPx(int2 p)
-{
-    return int2(clamp(p.x, 0, _TexWidth - 1), clamp(p.y, 0, _TexHeight - 1));
-}
-
-float4 LoadWorld(int2 p)
-{
-    return _WorldPosTex[ClampPx(p)];
-}
-
-float LoadEdge(int2 p)
-{
-    return _EdgeTex[ClampPx(p)].r;
-}
-
-float SampleEdgeBilinear(float2 p)
-{
+float SampleEdgeBilinear(float2 p) {
     float2 pp = clamp(p, float2(0, 0), float2(_TexWidth - 1, _TexHeight - 1));
-    int x0 = (int)floor(pp.x);
-    int y0 = (int)floor(pp.y);
-    int x1 = min(x0 + 1, _TexWidth - 1);
-    int y1 = min(y0 + 1, _TexHeight - 1);
-    float fx = pp.x - x0;
-    float fy = pp.y - y0;
-
-    float e00 = _EdgeTex[uint2(x0, y0)].r;
-    float e10 = _EdgeTex[uint2(x1, y0)].r;
-    float e01 = _EdgeTex[uint2(x0, y1)].r;
-    float e11 = _EdgeTex[uint2(x1, y1)].r;
-
-    float e0 = lerp(e00, e10, fx);
-    float e1 = lerp(e01, e11, fx);
-    return lerp(e0, e1, fy);
+    int x0 = (int)floor(pp.x); int y0 = (int)floor(pp.y);
+    int x1 = min(x0 + 1, _TexWidth - 1); int y1 = min(y0 + 1, _TexHeight - 1);
+    float fx = pp.x - x0; float fy = pp.y - y0;
+    float e00 = _EdgeTex[uint2(x0, y0)].r; float e10 = _EdgeTex[uint2(x1, y0)].r;
+    float e01 = _EdgeTex[uint2(x0, y1)].r; float e11 = _EdgeTex[uint2(x1, y1)].r;
+    return lerp(lerp(e00, e10, fx), lerp(e01, e11, fx), fy);
 }
 
-float4 SampleWorldPosBilinearValid(float2 p)
-{
-    float2 pp = clamp(p, float2(0, 0), float2(_TexWidth - 1, _TexHeight - 1));
-    int x0 = (int)floor(pp.x);
-    int y0 = (int)floor(pp.y);
-    int x1 = min(x0 + 1, _TexWidth - 1);
-    int y1 = min(y0 + 1, _TexHeight - 1);
-    float fx = pp.x - x0;
-    float fy = pp.y - y0;
-
-    float w00 = (1.0 - fx) * (1.0 - fy);
-    float w10 = fx * (1.0 - fy);
-    float w01 = (1.0 - fx) * fy;
-    float w11 = fx * fy;
-
-    float4 p00 = _WorldPosTex[uint2(x0, y0)];
-    float4 p10 = _WorldPosTex[uint2(x1, y0)];
-    float4 p01 = _WorldPosTex[uint2(x0, y1)];
-    float4 p11 = _WorldPosTex[uint2(x1, y1)];
-
-    float3 sum = float3(0, 0, 0);
-    float sumW = 0.0;
-    if (IsValidPos(p00)) { sum += p00.xyz * w00; sumW += w00; }
-    if (IsValidPos(p10)) { sum += p10.xyz * w10; sumW += w10; }
-    if (IsValidPos(p01)) { sum += p01.xyz * w01; sumW += w01; }
-    if (IsValidPos(p11)) { sum += p11.xyz * w11; sumW += w11; }
-
-    if (sumW <= 1e-6) return float4(0, 0, 0, 0);
-    return float4(sum / sumW, 1.0);
+bool IsNmsPeak(int px, int py, float edge, float2 grad) {
+    float gl = length(grad); if (gl < 1e-6) return false;
+    float2 n = grad / gl; float2 p = float2((float)px, (float)py);
+    return edge + _NmsRelaxation >= max(SampleEdgeBilinear(p + n), SampleEdgeBilinear(p - n));
 }
 
-float2 EdgeGradSobel(int px, int py)
-{
-    float tl = LoadEdge(int2(px - 1, py - 1));
-    float tc = LoadEdge(int2(px,     py - 1));
-    float tr = LoadEdge(int2(px + 1, py - 1));
-    float ml = LoadEdge(int2(px - 1, py));
-    float mr = LoadEdge(int2(px + 1, py));
-    float bl = LoadEdge(int2(px - 1, py + 1));
-    float bc = LoadEdge(int2(px,     py + 1));
-    float br = LoadEdge(int2(px + 1, py + 1));
-
-    float gx = -tl + tr - 2.0 * ml + 2.0 * mr - bl + br;
-    float gy = -tl - 2.0 * tc - tr + bl + 2.0 * bc + br;
-    return float2(gx, gy);
+float SubpixelOffset(float2 p, float2 n) {
+    float eM = SampleEdgeBilinear(p - n); float e0 = SampleEdgeBilinear(p); float eP = SampleEdgeBilinear(p + n);
+    float denom = eM - 2.0 * e0 + eP; if (abs(denom) < 1e-6) return 0.0;
+    return clamp(0.5 * (eM - eP) / denom, -0.5, 0.5);
 }
 
-bool IsEdgeNmsPeak(int px, int py, float edgeCenter, float2 grad)
-{
-    float gl = length(grad);
-    if (gl < 1e-6) return false;
-    float2 n = grad / gl;
-    float2 p = float2((float)px, (float)py);
-    float e1 = SampleEdgeBilinear(p + n);
-    float e2 = SampleEdgeBilinear(p - n);
-    return edgeCenter + _NmsRelaxation >= max(e1, e2);
+void QuantizedStep(float2 dir, out int sx, out int sy) {
+    sx = 0; sy = 0; float ax = abs(dir.x); float ay = abs(dir.y);
+    if (ax >= ay) { sx = dir.x >= 0.0 ? 1 : -1; if (ay > ax * 0.5) sy = dir.y >= 0.0 ? 1 : -1; }
+    else { sy = dir.y >= 0.0 ? 1 : -1; if (ax > ay * 0.5) sx = dir.x >= 0.0 ? 1 : -1; }
 }
 
-float SubpixelPeakOffset(float2 p, float2 n)
-{
-    float eM = SampleEdgeBilinear(p - n);
-    float e0 = SampleEdgeBilinear(p);
-    float eP = SampleEdgeBilinear(p + n);
-    float denom = eM - 2.0 * e0 + eP;
-    if (abs(denom) < 1e-6) return 0.0;
-    float t = 0.5 * (eM - eP) / denom;
-    return clamp(t, -0.5, 0.5);
-}
-
-bool HasInvalidWorldNeighbor(int px, int py)
-{
-    [unroll]
-    for (int dy = -1; dy <= 1; dy++)
-    {
-        [unroll]
-        for (int dx = -1; dx <= 1; dx++)
-        {
-            if (dx == 0 && dy == 0) continue;
-            float4 wp = LoadWorld(int2(px + dx, py + dy));
-            if (!IsValidPos(wp)) return true;
-        }
-    }
-    return false;
-}
-
-void QuantizedStep(float2 dir, out int sx, out int sy)
-{
-    sx = 0; sy = 0;
-    float ax = abs(dir.x);
-    float ay = abs(dir.y);
-
-    if (ax >= ay)
-    {
-        sx = dir.x >= 0.0 ? 1 : -1;
-        if (ay > ax * 0.5) sy = dir.y >= 0.0 ? 1 : -1;
-    }
-    else
-    {
-        sy = dir.y >= 0.0 ? 1 : -1;
-        if (ax > ay * 0.5) sx = dir.x >= 0.0 ? 1 : -1;
-    }
-}
-
-float4 PickBestWorldPos(int px, int py, float2 n, float2 subPix, out bool sideMismatch)
-{
-    int sx, sy;
-    QuantizedStep(n, sx, sy);
-    float4 c = LoadWorld(int2(px, py));
-    float4 s1 = LoadWorld(int2(px + sx, py + sy));
-    float4 s2 = LoadWorld(int2(px - sx, py - sy));
-    bool v1 = IsValidPos(s1);
-    bool v2 = IsValidPos(s2);
+float4 PickBestWorldPos(int px, int py, float2 n, out bool sideMismatch) {
+    int sx, sy; QuantizedStep(n, sx, sy);
+    float4 c  = LoadWorld(int2(px, py)); float4 s1 = LoadWorld(int2(px + sx, py + sy)); float4 s2 = LoadWorld(int2(px - sx, py - sy));
+    bool vc = IsValidPos(c); bool v1 = IsValidPos(s1); bool v2 = IsValidPos(s2);
     sideMismatch = (v1 != v2);
-
-    float4 bil = SampleWorldPosBilinearValid(subPix - n * 0.25);
-    if (v1 && !v2) return IsValidPos(bil) ? float4(lerp(s1.xyz, bil.xyz, 0.65), 1.0) : s1;
-    if (!v1 && v2) return IsValidPos(bil) ? float4(lerp(s2.xyz, bil.xyz, 0.65), 1.0) : s2;
-
-    if (v1 && v2)
-    {
-        float4 chosen = s1;
-        if (IsValidPos(c))
-        {
-            float d1 = length(s1.xyz - c.xyz);
-            float d2 = length(s2.xyz - c.xyz);
-            chosen = (d1 <= d2) ? s1 : s2;
-        }
-        if (IsValidPos(bil)) return float4(lerp(chosen.xyz, bil.xyz, 0.65), 1.0);
-        return chosen;
+    if ( v1 && !v2) return vc ? c : s1;
+    if (!v1 &&  v2) return vc ? c : s2;
+    if (v1 && v2) {
+        float3 toC  = c.xyz  - _CameraWorldPos; float3 to1  = s1.xyz - _CameraWorldPos; float3 to2  = s2.xyz - _CameraWorldPos;
+        float dc = vc ? dot(toC, toC) : 1e20; float d1 = dot(to1, to1); float d2 = dot(to2, to2);
+        if (vc && dc <= d1 && dc <= d2) return c; return (d1 <= d2) ? s1 : s2;
     }
-
-    if (IsValidPos(bil)) return bil;
-    if (IsValidPos(c)) return c;
-    return float4(0, 0, 0, 0);
+    if (vc) return c; return float4(0, 0, 0, 0);
 }
 
+float3 DecodeNormalFromTex(int2 p) {
+    float4 enc = _NormalTex[ClampPx(p)]; float kScale = 1.7777;
+    float3 nn = enc.xyz * float3(2.0 * kScale, 2.0 * kScale, 0.0) + float3(-kScale, -kScale, 1.0);
+    float g = 2.0 / dot(nn, nn); float3 n; n.xy = g * nn.xy; n.z  = g - 1.0; return n;
+}
+
+// KERNEL 1: Akıllı Filtreleme (Yanlış iç çizgileri siler, silüetleri korur)
 [numthreads(8, 8, 1)]
-void BuildEdgePositionBuffer(uint3 id : SV_DispatchThreadID)
-{
-    int px = (int)id.x;
-    int py = (int)id.y;
+void BuildEdgePositionBuffer(uint3 id : SV_DispatchThreadID) {
+    int px = (int)id.x; int py = (int)id.y;
     if (px >= _TexWidth || py >= _TexHeight) return;
-
     float4 outPos = float4(0, 0, 0, 0);
+    
     float edge = LoadEdge(int2(px, py));
-    if (edge <= _MinEdgeThreshold)
-    {
-        _RWEdgePosTex[uint2(px, py)] = outPos;
-        return;
-    }
+    if (edge <= _MinEdgeThreshold) { _RWEdgePosTex[uint2(px, py)] = outPos; return; }
 
-    float2 grad = EdgeGradSobel(px, py);
-    float gl = length(grad);
-    if (gl <= 1e-6 || !IsEdgeNmsPeak(px, py, edge, grad))
-    {
-        _RWEdgePosTex[uint2(px, py)] = outPos;
-        return;
-    }
+    float2 grad = EdgeGradSobel(px, py); float gl = length(grad);
+    if (gl <= 1e-6 || !IsNmsPeak(px, py, edge, grad)) { _RWEdgePosTex[uint2(px, py)] = outPos; return; }
 
-    float2 n = grad / gl;
-    float2 p = float2((float)px, (float)py);
-    float t = SubpixelPeakOffset(p, n);
-    float2 subPix = p + n * t;
+    float2 n = grad / gl; float2 p = float2((float)px, (float)py); float t = SubpixelOffset(p, n);
+    bool sideMismatch = false; float4 wp = PickBestWorldPos(px, py, n, sideMismatch);
+    if (!IsValidPos(wp)) { _RWEdgePosTex[uint2(px, py)] = outPos; return; }
 
-    bool sideMismatch = false;
-    float4 wp = PickBestWorldPos(px, py, n, subPix, sideMismatch);
-    if (!IsValidPos(wp))
-    {
-        _RWEdgePosTex[uint2(px, py)] = outPos;
-        return;
-    }
+    // İSTENMEYEN ÇİZGİ SİLİCİ: Üst kenarın hemen altındaki düz yüzeydeki zayıf çizgileri siler.
+    if (_UseGeomDiscontinuityFilter > 0) {
+        int sx, sy; QuantizedStep(n, sx, sy);
+        float4 a = LoadWorld(int2(px + sx, py + sy)); float4 b = LoadWorld(int2(px - sx, py - sy));
+        
+        if (IsValidPos(a) && IsValidPos(b)) {
+            float geomDist = length(a.xyz - b.xyz);
+            float3 nA = DecodeNormalFromTex(int2(px + sx, py + sy));
+            float3 nB = DecodeNormalFromTex(int2(px - sx, py - sy));
+            float normalDot = dot(normalize(nA), normalize(nB));
 
-    // BoundaryTransition aciksa bile cok guclu edge'leri tamamen kaybetmeyelim.
-    if (_RequireBoundaryTransition > 0 && !sideMismatch && edge < (_MinEdgeThreshold * 2.4))
-    {
-        _RWEdgePosTex[uint2(px, py)] = outPos;
-        return;
-    }
-    // Buyuk kernel'da (19+) zayif non-boundary noktalar yanlis birlesmeye sebep olabiliyor.
-    if (_KernelSize >= 19 && !sideMismatch && !HasInvalidWorldNeighbor(px, py) && edge < (_MinEdgeThreshold * 2.2))
-    {
-        _RWEdgePosTex[uint2(px, py)] = outPos;
-        return;
-    }
-
-    if (_UseGeomDiscontinuityFilter > 0)
-    {
-        int sx, sy;
-        QuantizedStep(n, sx, sy);
-        float4 a = LoadWorld(int2(px + sx, py + sy));
-        float4 b = LoadWorld(int2(px - sx, py - sy));
-        bool va = IsValidPos(a);
-        bool vb = IsValidPos(b);
-
-        if (!va && !vb)
-        {
-            _RWEdgePosTex[uint2(px, py)] = outPos;
-            return;
-        }
-        if (va && vb)
-        {
-            float d = length(a.xyz - b.xyz);
-            if (d < _MinGeomDiscontinuity)
-            {
-                bool nearBoundary = HasInvalidWorldNeighbor(px, py);
-                bool strongEdge = edge > (_MinEdgeThreshold * 1.5);
-                if (!nearBoundary && !strongEdge)
-                {
-                    _RWEdgePosTex[uint2(px, py)] = outPos;
-                    return;
+            // Eğer yüzey dümdüzse (normalDot > 0.95) ve derinlik farkı yoksa, bu gerçek bir kenar değildir!
+            if (normalDot > 0.95 && geomDist < _MinGeomDiscontinuity) {
+                if (edge < _MinEdgeThreshold * 2.5) { 
+                    _RWEdgePosTex[uint2(px, py)] = outPos; return; 
                 }
             }
         }
     }
-
+    
     _RWEdgePosTex[uint2(px, py)] = float4(wp.xyz, 1.0);
 }
 
+// KERNEL 2: Esnek ve Stabil RANSAC (Kopmaları önler)
 [numthreads(8, 8, 1)]
-void FitMicroLines(uint3 id : SV_DispatchThreadID)
-{
-    int k = _KernelSize;
-    int startX = id.x * k;
-    int startY = id.y * k;
+void FitMicroLines(uint3 id : SV_DispatchThreadID) {
+    int k = _KernelSize; int startX = id.x * k; int startY = id.y * k;
     if (startX >= _TexWidth || startY >= _TexHeight) return;
-    int endX = min(startX + k, _TexWidth);
-    int endY = min(startY + k, _TexHeight);
+    int endX = min(startX + k, _TexWidth); int endY = min(startY + k, _TexHeight);
+    float kT = saturate(((float)k - 5.0) / 16.0);
 
-    float3 pts3d[MAX_PTS];
-    float2 pts2d[MAX_PTS];
+    float3 pts3d[MAX_PTS]; float2 pts2d[MAX_PTS]; float3 ptsNorm[MAX_PTS];
     int cnt = 0;
+    
+    float distRef = -1.0;
 
-    for (int y = startY; y < endY; y++)
-    {
-        for (int x = startX; x < endX; x++)
-        {
+    for (int y = startY; y < endY; y++) {
+        for (int x = startX; x < endX; x++) {
             float4 ep = _EdgePosTex[uint2(x, y)];
             if (ep.w <= 0.0) continue;
-            pts3d[cnt] = ep.xyz;
-            pts2d[cnt] = float2((float)x, (float)y);
-            cnt++;
-            if (cnt >= MAX_PTS) break;
+            
+            float d = distance(ep.xyz, _CameraWorldPos);
+            if (cnt == 0) distRef = d;
+            else if (abs(d - distRef) > distRef * 0.25) continue; // Aynı derinliktekileri grupla
+
+            pts3d[cnt]  = ep.xyz; pts2d[cnt]  = float2((float)x, (float)y); ptsNorm[cnt] = DecodeNormalFromTex(int2(x, y));
+            cnt++; if (cnt >= MAX_PTS) break;
         }
         if (cnt >= MAX_PTS) break;
     }
 
-    if (cnt < _MinPointsForLine) return;
+    int tileArea    = (endX - startX) * (endY - startY);
+    int ratioBased  = (int)ceil((float)tileArea * _MinEdgePointRatio);
+    int hardMinPts  = max(_MinPointsForLine, max(ratioBased, 4));
+    if (cnt < hardMinPts) return;
 
-    if (_DebugMode > 0)
-    {
-        for (int i = 0; i < cnt; i++)
-        {
-            MicroLine p;
-            p.sx = pts3d[i].x; p.sy = pts3d[i].y; p.sz = pts3d[i].z;
-            p.ex = pts3d[i].x; p.ey = pts3d[i].y; p.ez = pts3d[i].z;
+    if (_DebugMode > 0) {
+        for (int i = 0; i < cnt; i++) {
+            MicroLine p; p.sx = pts3d[i].x; p.sy = pts3d[i].y; p.sz = pts3d[i].z; p.ex = pts3d[i].x; p.ey = pts3d[i].y; p.ez = pts3d[i].z;
             _DebugPoints.Append(p);
         }
         return;
     }
 
-    // Buyuk kernel'larda (17+) bir tile icinde birden fazla edge kolu karisabiliyor.
-    // Dominant 2D banda kompaksiyon, cube'deki garip capraz birlesmeleri ciddi azaltir.
-    float kT = saturate(((float)k - 5.0) / 16.0); // 5 -> 0, 21 -> 1
-    if (cnt >= max(_MinPointsForLine, 6))
-    {
-        float2 mean2d = float2(0, 0);
-        for (int i = 0; i < cnt; i++) mean2d += pts2d[i];
-        mean2d /= (float)cnt;
-
+    if (cnt >= max(_MinPointsForLine, 6)) {
+        float2 mean2d = float2(0, 0); for (int i = 0; i < cnt; i++) mean2d += pts2d[i]; mean2d /= (float)cnt;
         float c11b = 0, c12b = 0, c22b = 0;
-        for (int i = 0; i < cnt; i++)
-        {
-            float2 d = pts2d[i] - mean2d;
-            c11b += d.x * d.x;
-            c12b += d.x * d.y;
-            c22b += d.y * d.y;
+        for (int i = 0; i < cnt; i++) { float2 d = pts2d[i] - mean2d; c11b += d.x * d.x; c12b += d.x * d.y; c22b += d.y * d.y; }
+        float2 pcaDir = float2(1, 0);
+        [unroll] for (int it = 0; it < PCA_ITER; it++) {
+            float2 Ct = float2(c11b * pcaDir.x + c12b * pcaDir.y, c12b * pcaDir.x + c22b * pcaDir.y);
+            float l = length(Ct); if (l > 1e-6) pcaDir = Ct / l;
         }
-
-        float2 t2 = float2(1, 0);
-        [unroll]
-        for (int it = 0; it < 6; it++)
-        {
-            float2 Ct = float2(
-                c11b * t2.x + c12b * t2.y,
-                c12b * t2.x + c22b * t2.y
-            );
-            float l = length(Ct);
-            if (l > 1e-6) t2 = Ct / l;
-        }
-
-        float2 n2 = float2(-t2.y, t2.x);
-        float dMin = 1e20, dMax = -1e20;
-        float dist[MAX_PTS];
-        for (int i = 0; i < cnt; i++)
-        {
-            float di = dot(pts2d[i] - mean2d, n2);
-            dist[i] = di;
-            dMin = min(dMin, di);
-            dMax = max(dMax, di);
-        }
-
+        float2 pcaNorm = float2(-pcaDir.y, pcaDir.x);
+        float dMin = 1e20, dMax = -1e20; float distArr[MAX_PTS];
+        for (int i = 0; i < cnt; i++) { float di = dot(pts2d[i] - mean2d, pcaNorm); distArr[i] = di; dMin = min(dMin, di); dMax = max(dMax, di); }
         float dRange = dMax - dMin;
-        if (dRange > 1e-5)
-        {
-            const int BINS = 12;
-            int hist[BINS];
-            [unroll] for (int b = 0; b < BINS; b++) hist[b] = 0;
-
+        if (dRange > 1e-5) {
+            int hist[HIST_BINS]; [unroll] for (int b = 0; b < HIST_BINS; b++) hist[b] = 0;
             float inv = 1.0 / dRange;
-            for (int i = 0; i < cnt; i++)
-            {
-                float dn = saturate((dist[i] - dMin) * inv);
-                int b = min((int)(dn * (float)BINS), BINS - 1);
-                hist[b]++;
-            }
-
-            int bestB = 0;
-            int bestC = hist[0];
-            [unroll]
-            for (int b = 1; b < BINS; b++)
-            {
-                if (hist[b] > bestC) { bestC = hist[b]; bestB = b; }
-            }
-
-            float domRatio = (float)bestC / (float)cnt;
-            float domReq = lerp(0.34, 0.24, kT);
-            bool forceDominant = (k >= 21);
-            if (domRatio >= domReq || forceDominant)
-            {
-                float binSize = dRange / (float)BINS;
-                float center = dMin + ((float)bestB + 0.5) * binSize;
-                float band = max(binSize * lerp(1.12, 0.92, kT), lerp(1.00, 0.78, kT));
-                if (forceDominant) band *= 0.90; // 21x21'de daha net tek kol
-
+            for (int i = 0; i < cnt; i++) { float dn = saturate((distArr[i] - dMin) * inv); int b = min((int)(dn * (float)HIST_BINS), HIST_BINS - 1); hist[b]++; }
+            int bestB = 0, bestC = hist[0];
+            [unroll] for (int b = 1; b < HIST_BINS; b++) { if (hist[b] > bestC) { bestC = hist[b]; bestB = b; } }
+            float domRatio = (float)bestC / (float)cnt; float domReq = lerp(0.34, 0.24, kT); bool forceDom = (k >= 21);
+            if (domRatio >= domReq || forceDom) {
+                float binSize = dRange / (float)HIST_BINS; float center  = dMin + ((float)bestB + 0.5) * binSize;
+                float band    = max(binSize * lerp(1.12, 0.92, kT), lerp(1.00, 0.78, kT)); if (forceDom) band *= 0.90;
                 int keep = 0;
-                for (int i = 0; i < cnt; i++)
-                {
-                    if (abs(dist[i] - center) <= band)
-                    {
-                        pts3d[keep] = pts3d[i];
-                        pts2d[keep] = pts2d[i];
-                        keep++;
-                    }
+                for (int i = 0; i < cnt; i++) {
+                    if (abs(distArr[i] - center) <= band) { pts3d[keep]  = pts3d[i]; pts2d[keep]  = pts2d[i]; ptsNorm[keep] = ptsNorm[i]; keep++; }
                 }
-                if (keep >= max(_MinPointsForLine, 3))
-                    cnt = keep;
+                if (keep >= max(_MinPointsForLine, 3)) cnt = keep;
             }
         }
     }
 
     float cntT = saturate((float)cnt / 20.0);
     float effInlier = _InlierThreshold * lerp(1.35, 1.0, cntT);
-    float effMaxLen = _MaxSegLength * lerp(1.55, 1.0, cntT);
-    // Buyuk kernel'da yanlis edge birlesmelerini azaltmak icin segment uzunlugunu hafif kis.
-    effMaxLen *= lerp(1.0, 0.86, kT);
-    float thSq = effInlier * effInlier;
+    float effMaxLen = _MaxSegLength * lerp(1.55, 1.0, cntT); effMaxLen *= lerp(1.0, 0.86, kT);
+    float tightInlier = effInlier * 0.05; float looseInlier = effInlier;
+    float thSqTight = tightInlier * tightInlier; float thSqLoose = looseInlier * looseInlier;
     float segSq = effMaxLen * effMaxLen;
 
     uint seed = WangHash(id.x * 73856093u + id.y * 19349663u + _FrameSeed * 83492791u + 1u);
-    int bestCount = 0;
-    int bestI1 = 0;
-    int bestI2 = 1;
-    int maxIter = min(72, (int)((uint)cnt * ((uint)cnt - 1u) / 2u));
+    int bestCountTight = 0, bestCountLoose = 0; int bestI1T = 0, bestI2T = 1; int bestI1L = 0, bestI2L = 1;
+    int maxIter = min(RANSAC_ITER, (int)((uint)cnt * ((uint)cnt - 1u) / 2u));
 
-    for (int it = 0; it < maxIter; it++)
-    {
-        seed = WangHash(seed);
-        int i1 = seed % (uint)cnt;
-        seed = WangHash(seed);
-        int i2 = seed % (uint)cnt;
+    // MESAFE ZORUNLULUĞU (Kısa enine çizgileri imkansız hale getirir, yatay uzun kenarları bulmaya zorlar)
+    float minSpan = max(2.0, (float)k * 0.35);
+
+    for (int it = 0; it < maxIter; it++) {
+        seed = WangHash(seed); int i1 = seed % (uint)cnt; seed = WangHash(seed); int i2 = seed % (uint)cnt;
         if (i1 == i2) continue;
+        
+        float seedDist2D = distance(pts2d[i1], pts2d[i2]);
+        if (seedDist2D < minSpan) continue; // Çok kısa seçimleri engelle
 
-        float3 a = pts3d[i1];
-        float3 b = pts3d[i2];
-        float3 ab = b - a;
-        float abLenSq = dot(ab, ab);
+        float3 a = pts3d[i1]; float3 b = pts3d[i2]; float3 ab = b - a; float abLenSq = dot(ab, ab);
         if (abLenSq < 1e-16 || abLenSq > segSq) continue;
 
-        float3 dir = ab / sqrt(abLenSq);
-        int inl = 0;
-        for (int j = 0; j < cnt; j++)
-        {
-            float3 d = pts3d[j] - a;
-            float3 cr = cross(d, dir);
-            if (dot(cr, cr) < thSq) inl++;
+        // SPAGETTI KILLER (Farklı derinliklerdeki noktaları birleştirmeyi engelle)
+        float distA = distance(a, _CameraWorldPos); float distB = distance(b, _CameraWorldPos);
+        if (abs(distA - distB) > min(distA, distB) * 0.15) continue; 
+
+        float3 dir = ab / sqrt(abLenSq); int inlTight = 0, inlLoose = 0;
+        for (int j = 0; j < cnt; j++) {
+            float3 d  = pts3d[j] - a; float3 cr = cross(d, dir); float distSq = dot(cr, cr);
+            if (distSq < thSqTight) inlTight++;
+            if (distSq < thSqLoose) inlLoose++;
         }
-        if (inl > bestCount)
-        {
-            bestCount = inl;
-            bestI1 = i1;
-            bestI2 = i2;
+        if (inlTight > bestCountTight) { bestCountTight = inlTight; bestI1T = i1; bestI2T = i2; }
+        if (inlLoose > bestCountLoose) { bestCountLoose = inlLoose; bestI1L = i1; bestI2L = i2; }
+    }
+
+    int bestCount, bestI1, bestI2; float thSq; float tightRatio = (cnt > 0) ? (float)bestCountTight / (float)cnt : 0;
+    if (bestCountTight >= max(hardMinPts, 4) && tightRatio >= 0.4) { bestCount = bestCountTight; bestI1 = bestI1T; bestI2 = bestI2T; thSq = thSqTight; }
+    else { bestCount = bestCountLoose; bestI1 = bestI1L; bestI2 = bestI2L; thSq = thSqLoose; }
+
+    int minSupport = max(hardMinPts, 3); if (minSupport > cnt) minSupport = max(3, cnt);
+    if (bestCount < minSupport) return;
+    float inlierRatio = (float)bestCount / (float)cnt; float ratioRelaxT = saturate((float)cnt / 18.0);
+    float effMinRatio = lerp(_MinInlierRatio * 0.65, _MinInlierRatio, ratioRelaxT); effMinRatio = max(effMinRatio, 0.35);
+    if (inlierRatio < effMinRatio) return;
+
+    float3 bestA   = pts3d[bestI1]; float3 bestDir = normalize(pts3d[bestI2] - bestA);
+    float3 avgNormal = float3(0, 0, 0); int normalCount = 0;
+    for (int i = 0; i < cnt; i++) {
+        float3 d  = pts3d[i] - bestA; float3 cr = cross(d, bestDir);
+        if (dot(cr, cr) < thSq) { avgNormal += ptsNorm[i]; normalCount++; }
+    }
+
+    bool useNormalFilter = (normalCount >= 4 && _NormalDotThreshold > 0.01);
+    if (useNormalFilter && normalCount > 0) {
+        avgNormal = normalize(avgNormal / (float)normalCount); int groupA = 0, groupB = 0;
+        for (int i = 0; i < cnt; i++) {
+            float3 d  = pts3d[i] - bestA; float3 cr = cross(d, bestDir);
+            if (dot(cr, cr) < thSq) { float dp = dot(ptsNorm[i], avgNormal); if (dp >= _NormalDotThreshold) groupA++; else groupB++; }
+        }
+        if (groupA > 0 && groupB > 0 && (groupA + groupB) >= 4) {
+            bool keepGroupA = (groupA >= groupB); int keep = 0;
+            for (int i = 0; i < cnt; i++) {
+                float3 d  = pts3d[i] - bestA; float3 cr = cross(d, bestDir); bool isInlier = dot(cr, cr) < thSq;
+                if (isInlier) {
+                    float dp = dot(ptsNorm[i], avgNormal); bool inGroupA = (dp >= _NormalDotThreshold);
+                    if ((keepGroupA && inGroupA) || (!keepGroupA && !inGroupA)) { pts3d[keep] = pts3d[i]; pts2d[keep] = pts2d[i]; ptsNorm[keep] = ptsNorm[i]; keep++; }
+                } else { pts3d[keep] = pts3d[i]; pts2d[keep] = pts2d[i]; ptsNorm[keep] = ptsNorm[i]; keep++; }
+            }
+            if (keep >= max(minSupport, 3)) cnt = keep;
         }
     }
 
-    int minSupport = max(min(_MinPointsForLine, cnt), 2);
-    if (bestCount < minSupport) return;
-
-    float inlierRatio = (float)bestCount / (float)cnt;
-    float ratioRelaxT = saturate((float)cnt / 18.0);
-    float effMinRatio = lerp(_MinInlierRatio * 0.52, _MinInlierRatio, ratioRelaxT);
-    effMinRatio = max(effMinRatio, 0.22);
-    if (inlierRatio < effMinRatio) return;
-
-    float3 bestA = pts3d[bestI1];
-    float3 bestDir = normalize(pts3d[bestI2] - bestA);
-
-    // Inlier mean
-    float3 mean3d = float3(0, 0, 0);
-    int inlierCount = 0;
-    for (int i = 0; i < cnt; i++)
-    {
-        float3 d = pts3d[i] - bestA;
-        float3 cr = cross(d, bestDir);
-        if (dot(cr, cr) < thSq)
-        {
-            mean3d += pts3d[i];
-            inlierCount++;
-        }
+    float3 mean3d = float3(0, 0, 0); int inlierCount = 0;
+    for (int i = 0; i < cnt; i++) {
+        float3 d  = pts3d[i] - bestA; float3 cr = cross(d, bestDir);
+        if (dot(cr, cr) < thSq) { mean3d += pts3d[i]; inlierCount++; }
     }
     if (inlierCount < minSupport) return;
     mean3d /= (float)inlierCount;
 
-    // PCA direction on inliers
-    float c11 = 0, c12 = 0, c13 = 0;
-    float c22 = 0, c23 = 0, c33 = 0;
-    for (int i = 0; i < cnt; i++)
-    {
-        float3 d = pts3d[i] - bestA;
-        float3 cr = cross(d, bestDir);
-        if (dot(cr, cr) < thSq)
-        {
-            float3 dv = pts3d[i] - mean3d;
-            c11 += dv.x * dv.x; c12 += dv.x * dv.y; c13 += dv.x * dv.z;
-            c22 += dv.y * dv.y; c23 += dv.y * dv.z;
-            c33 += dv.z * dv.z;
+    float c11 = 0, c12 = 0, c13 = 0; float c22 = 0, c23 = 0, c33 = 0;
+    for (int i = 0; i < cnt; i++) {
+        float3 d  = pts3d[i] - bestA; float3 cr = cross(d, bestDir);
+        if (dot(cr, cr) < thSq) {
+            float3 dv = pts3d[i] - mean3d; c11 += dv.x * dv.x; c12 += dv.x * dv.y; c13 += dv.x * dv.z; c22 += dv.y * dv.y; c23 += dv.y * dv.z; c33 += dv.z * dv.z;
         }
     }
 
     float3 v = bestDir;
-    [unroll]
-    for (int it = 0; it < 8; it++)
-    {
-        float3 Cv = float3(
-            c11 * v.x + c12 * v.y + c13 * v.z,
-            c12 * v.x + c22 * v.y + c23 * v.z,
-            c13 * v.x + c23 * v.y + c33 * v.z
-        );
-        float l = length(Cv);
-        if (l > 1e-10) v = Cv / l;
+    [unroll] for (int it = 0; it < PCA_ITER3D; it++) {
+        float3 Cv = float3(c11 * v.x + c12 * v.y + c13 * v.z, c12 * v.x + c22 * v.y + c23 * v.z, c13 * v.x + c23 * v.y + c33 * v.z);
+        float l = length(Cv); if (l > 1e-10) v = Cv / l;
     }
 
-    // Projection stats + robust endpoint trimming
-    float minP = 1e10;
-    float maxP = -1e10;
-    float pSum = 0;
-    float pSqSum = 0;
-    float perpAccum = 0;
-    int perpCount = 0;
-
-    for (int i = 0; i < cnt; i++)
-    {
-        float3 d = pts3d[i] - bestA;
-        float3 cr = cross(d, bestDir);
-        if (dot(cr, cr) < thSq)
-        {
-            float3 dm = pts3d[i] - mean3d;
-            float p = dot(dm, v);
-            minP = min(minP, p);
-            maxP = max(maxP, p);
-            pSum += p;
-            pSqSum += p * p;
-
-            float3 q = dm - v * p;
-            perpAccum += dot(q, q);
-            perpCount++;
+    float minP = 1e10, maxP = -1e10; float pSum = 0, pSqSum = 0; float perpAccum = 0; int perpCount = 0;
+    for (int i = 0; i < cnt; i++) {
+        float3 d  = pts3d[i] - bestA; float3 cr = cross(d, bestDir);
+        if (dot(cr, cr) < thSq) {
+            float3 dm = pts3d[i] - mean3d; float p = dot(dm, v); minP = min(minP, p); maxP = max(maxP, p); pSum += p; pSqSum += p * p;
+            float3 q = dm - v * p; perpAccum += dot(q, q); perpCount++;
         }
     }
     if (perpCount < minSupport) return;
 
-    // trim outlier tails
-    if (perpCount >= 5)
-    {
-        float m = pSum / (float)perpCount;
-        float varP = max(0.0, pSqSum / (float)perpCount - m * m);
-        float sigma = sqrt(varP);
-        float sigmaMul = lerp(2.2, 1.6, kT);
-        float lo = m - sigma * sigmaMul;
-        float hi = m + sigma * sigmaMul;
-
-        float tMin = 1e10;
-        float tMax = -1e10;
-        int tCount = 0;
-        for (int i = 0; i < cnt; i++)
-        {
-            float3 d = pts3d[i] - bestA;
-            float3 cr = cross(d, bestDir);
-            if (dot(cr, cr) < thSq)
-            {
-                float3 dm = pts3d[i] - mean3d;
-                float p = dot(dm, v);
-                if (p < lo || p > hi) continue;
-                tMin = min(tMin, p);
-                tMax = max(tMax, p);
-                tCount++;
+    if (perpCount >= 5) {
+        float m    = pSum / (float)perpCount; float varP = max(0.0, pSqSum / (float)perpCount - m * m); float sigma = sqrt(varP);
+        float sigmaMul = lerp(2.2, 1.6, kT); float lo = m - sigma * sigmaMul; float hi = m + sigma * sigmaMul;
+        float tMin = 1e10, tMax = -1e10; int tCount = 0;
+        for (int i = 0; i < cnt; i++) {
+            float3 d  = pts3d[i] - bestA; float3 cr = cross(d, bestDir);
+            if (dot(cr, cr) < thSq) {
+                float3 dm = pts3d[i] - mean3d; float p = dot(dm, v); if (p < lo || p > hi) continue;
+                tMin = min(tMin, p); tMax = max(tMax, p); tCount++;
             }
         }
-        if (tCount >= 3 && tMin < tMax)
-        {
-            minP = tMin;
-            maxP = tMax;
-        }
+        if (tCount >= 3 && tMin < tMax) { minP = tMin; maxP = tMax; }
     }
 
     float segLen = maxP - minP;
     if (segLen < 1e-8 || segLen > effMaxLen) return;
 
-
-    // Buyuk kernel'da (19+) kopuk iki edge kolunun tek line'a baglanmasini azalt:
-    // Inlier noktalar line boyunca tek bir surekli banda dagilmali.
-    if (k >= 19)
-    {
-        const int OCC_BINS = 14;
-        int occ[OCC_BINS];
-        [unroll] for (int b = 0; b < OCC_BINS; b++) occ[b] = 0;
-
-        int occCount = 0;
-        for (int i = 0; i < cnt; i++)
-        {
-            float3 d = pts3d[i] - bestA;
-            float3 cr = cross(d, bestDir);
-            if (dot(cr, cr) < thSq)
-            {
-                float3 dm = pts3d[i] - mean3d;
-                float p = dot(dm, v);
-                float u = saturate((p - minP) / max(segLen, 1e-6));
-                int b = min((int)(u * (float)OCC_BINS), OCC_BINS - 1);
-                occ[b] = 1;
-                occCount++;
-            }
-        }
-
-        if (occCount >= 6)
-        {
-            int runs = 0;
-            int maxGap = 0;
-            int curGap = 0;
-            bool inRun = false;
-            for (int b = 0; b < OCC_BINS; b++)
-            {
-                if (occ[b] > 0)
-                {
-                    if (!inRun)
-                    {
-                        runs++;
-                        inRun = true;
-                    }
-                    curGap = 0;
-                }
-                else
-                {
-                    if (inRun)
-                    {
-                        curGap++;
-                        maxGap = max(maxGap, curGap);
-                    }
-                }
-            }
-
-            // Birden fazla destek adasi + belirgin bosluk varsa (cube capraz baglama) ele.
-            if (runs >= 2 && maxGap >= 2) return;
-        }
-    }
-
-    // 3D line quality
-    float alongVar = (segLen * segLen) * 0.0833333; // ~L^2/12
-    float perpVar = perpAccum / (float)perpCount;
-    float relax = saturate((float)perpCount / 12.0);
-    float effLinearity = lerp(_MinLinearityFactor * 0.48, _MinLinearityFactor, relax);
-    effLinearity = max(effLinearity, 1.0);
+    // Kopmaları önlemek için esnek kavis toleransı
+    float alongVar = (segLen * segLen) * 0.0833333; float perpVar  = perpAccum / (float)perpCount;
+    float effLinearity = _MinLinearityFactor * 0.2; 
     if (alongVar < perpVar * effLinearity) return;
 
-    // 2D straightness gate (helps curved-noisy tiles)
-    float2 mean2 = float2(0, 0);
-    int n2 = 0;
-    for (int i = 0; i < cnt; i++)
+    float totalSpan2D = 0.0;
     {
-        float3 d = pts3d[i] - bestA;
-        float3 cr = cross(d, bestDir);
-        if (dot(cr, cr) < thSq) { mean2 += pts2d[i]; n2++; }
-    }
-    if (n2 >= 3)
-    {
-        mean2 /= (float)n2;
-        float s11 = 0, s12 = 0, s22 = 0;
-        for (int i = 0; i < cnt; i++)
-        {
-            float3 d = pts3d[i] - bestA;
-            float3 cr = cross(d, bestDir);
-            if (dot(cr, cr) < thSq)
-            {
-                float2 dv = pts2d[i] - mean2;
-                s11 += dv.x * dv.x;
-                s12 += dv.x * dv.y;
-                s22 += dv.y * dv.y;
+        float2 lineDir2D = float2(0, 0); float2 mean2Dd   = float2(0, 0); int    ic3 = 0;
+        for (int i = 0; i < cnt; i++) { float3 d  = pts3d[i] - bestA; float3 cr = cross(d, bestDir); if (dot(cr, cr) < thSq) { mean2Dd += pts2d[i]; ic3++; } }
+        if (ic3 >= 4) {
+            mean2Dd /= (float)ic3; float s11 = 0, s12 = 0, s22 = 0;
+            for (int i = 0; i < cnt; i++) {
+                float3 d  = pts3d[i] - bestA; float3 cr = cross(d, bestDir); if (dot(cr, cr) >= thSq) continue;
+                float2 dv = pts2d[i] - mean2Dd; s11 += dv.x*dv.x; s12 += dv.x*dv.y; s22 += dv.y*dv.y;
             }
-        }
-
-        float2 v2 = float2(1, 0);
-        [unroll]
-        for (int it = 0; it < 6; it++)
-        {
-            float2 Cv = float2(s11 * v2.x + s12 * v2.y, s12 * v2.x + s22 * v2.y);
-            float l = length(Cv);
-            if (l > 1e-6) v2 = Cv / l;
-        }
-
-        float a2 = 0;
-        float p2 = 0;
-        for (int i = 0; i < cnt; i++)
-        {
-            float3 d = pts3d[i] - bestA;
-            float3 cr = cross(d, bestDir);
-            if (dot(cr, cr) < thSq)
-            {
-                float2 dv = pts2d[i] - mean2;
-                float a = dot(dv, v2);
-                float2 q = dv - v2 * a;
-                a2 += a * a;
-                p2 += dot(q, q);
+            float angle = 0.5 * atan2(2.0*s12, s11 - s22); lineDir2D = float2(cos(angle), sin(angle));
+            float proj2D[MAX_PTS]; int   sortCnt = 0;
+            for (int i = 0; i < cnt; i++) {
+                float3 d  = pts3d[i] - bestA; float3 cr = cross(d, bestDir);
+                if (dot(cr, cr) < thSq) proj2D[sortCnt++] = dot(pts2d[i] - mean2Dd, lineDir2D);
             }
+            for (int a = 1; a < sortCnt; a++) {
+                float kv = proj2D[a]; int b = a-1;
+                while (b >= 0 && proj2D[b] > kv) { proj2D[b+1] = proj2D[b]; b--; }
+                proj2D[b+1] = kv;
+            }
+            float maxGap = 0; for (int gi = 0; gi < sortCnt-1; gi++) maxGap = max(maxGap, proj2D[gi+1] - proj2D[gi]);
+            totalSpan2D = proj2D[sortCnt-1] - proj2D[0];
+            
+            // Kopmaları kapatmak için boşluk toleransı %75'e çıkarıldı
+            if (totalSpan2D > 3.0 && maxGap / max(totalSpan2D, 1e-5) > 0.75) return;
         }
-        float straight2D = lerp(1.18, 1.75, kT);
-        if (k >= 21 && n2 >= 8) straight2D += 0.08;
-        float along2Var = a2 / (float)n2;
-        float perp2Var = p2 / (float)n2;
-        bool pass2D = along2Var >= perp2Var * straight2D;
-        // 2D gate gecemese bile cok guclu 3D inlier destegi varsa kabul et.
-        if (!pass2D && !(inlierRatio >= 0.72 && cnt >= max(minSupport, 4))) return;
     }
 
-    float3 segStart = mean3d + v * minP;
-    float3 segEnd = mean3d + v * maxP;
-    MicroLine ml;
-    ml.sx = segStart.x; ml.sy = segStart.y; ml.sz = segStart.z;
-    ml.ex = segEnd.x;   ml.ey = segEnd.y;   ml.ez = segEnd.z;
+    // Kameraya direkt saplanan gerçek dikenleri siler
+    {
+        float3 segStart0 = mean3d + v * minP; float3 segEnd0   = mean3d + v * maxP;
+        float3 segVec    = segEnd0 - segStart0; float  segLen0   = length(segVec);
+        float3 midPt     = (segStart0 + segEnd0) * 0.5; float3 camDir    = normalize(midPt - _CameraWorldPos);
+        float3 lineDir0  = segLen0 > 1e-6 ? segVec / segLen0 : camDir; float radialDot  = abs(dot(lineDir0, camDir));
+        if (radialDot > 0.95 && totalSpan2D < 5.0) return;
+    }
+
+    float3 segStart = mean3d + v * minP; float3 segEnd   = mean3d + v * maxP;
+    MicroLine ml; ml.sx = segStart.x; ml.sy = segStart.y; ml.sz = segStart.z; ml.ex = segEnd.x;   ml.ey = segEnd.y;   ml.ez = segEnd.z;
     _OutputLines.Append(ml);
 }
-

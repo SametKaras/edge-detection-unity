@@ -382,21 +382,22 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::SceneCapture.EdgeDetectionEffect
   method: 0
   source: 1
-  edgeThreshold: 0.25
+  edgeThreshold: 0.1
   edgeColor: {r: 1, g: 1, b: 1, a: 1}
   backgroundColor: {r: 0, g: 0, b: 0, a: 1}
   depthWeight: 1
-  normalWeight: 0.8
+  normalWeight: 1
   colorWeight: 0
-  depthSensitivity: 0.1
+  depthSensitivity: 10
   maxDepth: 50
-  normalSensitivity: 10
+  normalSensitivity: 1
   minCreaseAngleDeg: 26
   useAlgorithmSupersampling: 1
   algorithmSupersampleScale: 2
   algorithmSmoothPasses: 1
   algorithmMagnitudeScale: 1.6
   invertOutput: 0
+  worldPosShader: {fileID: 4800000, guid: 0af80563903413747b9a9c0e0877549c, type: 3}
 --- !u!114 &963194232
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -404,7 +405,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 963194225}
-  m_Enabled: 1
+  m_Enabled: 0
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: a14dcd3358a96d04cbb4f9a771787395, type: 3}
   m_Name: 
@@ -412,27 +413,27 @@ MonoBehaviour:
   houghParams:
     thetaSteps: 180
     rhoBinSize: 1
-    peakThreshold: 25
-    nmsWindowSize: 15
+    peakThreshold: 15
+    nmsWindowSize: 5
     maxLines: 200
     segmentMinLength: 8
-    segmentMaxLength: 50
-    lineDistanceThreshold: 1.5
-    gradientAngleWindow: 20
-    minEdgeCoverage: 0.35
-    minDirectionConsistency: 0.55
-    minSupportingPixels: 10
+    segmentMaxLength: 60
+    lineDistanceThreshold: 2.5
+    gradientAngleWindow: 25
+    minEdgeCoverage: 0.25
+    minDirectionConsistency: 0.4
+    minSupportingPixels: 6
     downsampleFactor: 2
-    updateInterval: 5
+    updateInterval: 3
   edgeThreshold: 0.1
   edgeDetectionEffect: {fileID: 0}
   useLocalGradient: 1
-  localGradientRadius: 5
+  localGradientRadius: 8
   fallbackToLocalGradient: 1
   arrowLength: 60
   segmentColor: {r: 0, g: 1, b: 1, a: 0.5}
-  hoverRadius: 15
-  showAllSegments: 1
+  hoverRadius: 25
+  showAllSegments: 0
   enableKernelComparison: 1
   showHoughNormal: 1
   showKernel5x5: 1
@@ -454,31 +455,36 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 769d3ad86851344449781b88597711b5, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::SceneCapture.Edge3D.WorldSpaceEdgeManager
-  worldPosShader: {fileID: 4800000, guid: 0af80563903413747b9a9c0e0877549c, type: 3}
   microLineCS: {fileID: 7200000, guid: 0947c1e8888d4ea46bbbddbef0ec7809, type: 3}
-  updateInterval: 0.1
-  minEdgeLuminance: 0.1
+  updateInterval: 0.01
+  minEdgeLuminance: 0.15
   nmsRelaxation: 0.008
   useGeomDiscontinuityFilter: 1
   minGeomDiscontinuity: 0.006
   requireBoundaryTransition: 0
   kernelSize: 5
-  minPointsForLine: 2
+  minPointsForLine: 5
+  minEdgePointRatio: 0.2
   inlierThreshold: 0.08
   maxSegmentLength: 0.15
+  normalDotThreshold: 0.7
   autoScaleKernelWithResolution: 1
   referenceHeight: 1080
   kernelScaleExponent: 1
   autoScaleMinPointsForLine: 1
   minPointAreaRatio: 0.08
   maxAutoMinPoints: 14
-  minInlierRatio: 0.52
-  minLinearityFactor: 1.5
+  minInlierRatio: 0.6
+  minLinearityFactor: 2
+  useStableSeed: 1
+  stableSeedValue: 1337
   showLines: 1
+  lineColor: {r: 1, g: 0, b: 0, a: 1}
   visualLineThickness: 4
+  maxOutputLines: 5000
   showRawEdgePoints: 0
   rawPointColor: {r: 0, g: 1, b: 1, a: 1}
-  rawPointSize: 0.01
+  rawPointSize: 0.001
   showPerformance: 1
   _algorithmMs: 0
   _readbackMs: 0

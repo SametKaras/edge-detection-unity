@@ -2,46 +2,46 @@ Shader "Custom/WorldPosBuffer"
 {
     SubShader
     {
-        // Sadece opak objeleri işle.
         Tags { "RenderType"="Opaque" }
-        
+        ZTest Always ZWrite Off Cull Off
+
         Pass
         {
             CGPROGRAM
             #pragma vertex vert
             #pragma fragment frag
             #include "UnityCG.cginc"
-            
-            // Vertex Shader'dan Fragment Shader'a taşınacak veriler
-            struct v2f
+
+            struct appdata { float4 vertex : POSITION; float2 uv : TEXCOORD0; };
+            struct v2f     { float4 vertex : SV_POSITION; float2 uv : TEXCOORD0; };
+
+            sampler2D _CameraDepthTexture;
+            float4    _CameraDepthTexture_TexelSize;
+            float4x4  unity_MatrixInvVP;
+
+            v2f vert(appdata v) { v2f o; o.vertex = UnityObjectToClipPos(v.vertex); o.uv = v.uv; return o; }
+
+            float4 frag(v2f i) : SV_Target
             {
-                float4 vertex : SV_POSITION;    // Ekranda çizilecek konum 2D
-                float4 worldPos : TEXCOORD0;    // Hesaplanan 3D dünya konumu
-            };
-            
-            // ==================== VERTEX SHADER ====================
-            // Köşe noktalarının (vertex) konumlarını hesaplar.
-            v2f vert (appdata_base v)
-            {
-                v2f o;
-                
-                // 1. Çizim için: Modeli ekran koordinatlarına çevir.
-                o.vertex = UnityObjectToClipPos(v.vertex);
-                
-                // 2. Veri için: Modeli 3D dünya koordinatlarına çevir.
-                o.worldPos = mul(unity_ObjectToWorld, v.vertex);
-                
-                return o;
-            }
-            
-            // ==================== FRAGMENT SHADER ====================
-            // Her piksel için çalışır ve rengi belirler.
-            // Rengi "renk" olarak değil, "koordinat verisi" olarak kullanıyoruz.
-            float4 frag (v2f i) : SV_Target
-            {
-                // RGB kanallarına X,Y,Z koordinatlarını yaz.
-                // Alpha (W) kanalına 1.0 yaz (pikselin dolu olduğunu belirtmek için).
-                return float4(i.worldPos.xyz, 1.0);
+                float rawDepth = SAMPLE_DEPTH_TEXTURE(_CameraDepthTexture, i.uv);
+
+                float linear01 = Linear01Depth(rawDepth);
+                if (linear01 >= 0.9999) return float4(0, 0, 0, 0);
+
+                // renderIntoTexture=true → C#'ta invVP Y-flip içeriyor
+                // D3D: UV(0,0)=sol-üst, NDC Y=+1 üst → uv.y=0 → ndcY=+1 → negate şart
+                float ndcX =  i.uv.x * 2.0 - 1.0;
+                float ndcY = -(i.uv.y * 2.0 - 1.0);
+
+                #if defined(UNITY_REVERSED_Z)
+                    float ndcZ = rawDepth;
+                #else
+                    float ndcZ = rawDepth * 2.0 - 1.0;
+                #endif
+
+                float4 clipPos = float4(ndcX, ndcY, ndcZ, 1.0);
+                float4 wp = mul(unity_MatrixInvVP, clipPos);
+                return float4(wp.xyz / wp.w, 1.0);
             }
             ENDCG
         }

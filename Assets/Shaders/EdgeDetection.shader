@@ -1,341 +1,286 @@
+// ============================================================
+// EdgeDetection.shader
+// Image-space edge detection: Sobel / Roberts / Prewitt
+// Kaynak: Luminance / Depth / Normal / Combined
+// İki output modu:
+//   _OutputMagnitude=1 → raw magnitude (compute shader için)
+//   _OutputMagnitude=0 → binary threshold (ekran için)
+// ============================================================
 Shader "Custom/EdgeDetection"
 {
     Properties
     {
-        // Ana texture - kameranın renderladığı görüntü buraya gelir
         _MainTex ("Texture", 2D) = "white" {}
-        
-        // Kenar eşiği - bu değerin altındaki gradyanlar kenar sayılmaz
         _EdgeThreshold ("Edge Threshold", Range(0.001, 1.0)) = 0.1
-        
-        // Renk ayarları
+
         _EdgeColor ("Edge Color", Color) = (1, 1, 1, 1)
         _BackgroundColor ("Background Color", Color) = (0, 0, 0, 1)
-        
-        [KeywordEnum(Sobel, Roberts, Prewitt)] 
+
+        [KeywordEnum(Sobel, Roberts, Prewitt)]
         _Method ("Detection Method", Float) = 0
-        
-        [KeywordEnum(Luminance, Depth, Normal, Combined, Hybrid)]
+
+        [KeywordEnum(Luminance, Depth, Normal, Combined)]
         _Source ("Edge Source", Float) = 0
-        
-        // Derinlik ayarları
+
+        // Derinlik
         _DepthSensitivity ("Depth Sensitivity", Range(0.1, 100)) = 10.0
         _MaxDepth ("Max Depth", Float) = 50.0
-        
-        // Normal ayarları
+
+        // Normal
         _NormalSensitivity ("Normal Sensitivity", Range(0.1, 10)) = 1.0
-        
-        // Combined modda her kaynağın ağırlığı
-        _DepthWeight ("Depth Weight", Range(0, 1)) = 0.5
+
+        // Combined ağırlıklar
+        _DepthWeight  ("Depth Weight",  Range(0, 1)) = 0.5
         _NormalWeight ("Normal Weight", Range(0, 1)) = 0.5
-        _ColorWeight ("Color Weight", Range(0, 1)) = 0.3
-        
+        _ColorWeight  ("Color Weight",  Range(0, 1)) = 0.3
+
+        // Crease filtresi: cos(açı) eşiği
+        // dot > _MinCreaseDot → smooth yüzey → edge sayma
+        _MinCreaseDot ("Min Crease Dot", Range(0, 1)) = 0.9
+
         [Toggle] _InvertOutput ("Invert Output", Float) = 0
 
-        // YENİ: Thinning için magnitude output modu
-        // 1 = magnitude değerini doğrudan çıkar (thinning pass için)
-        // 0 = binary threshold uygula (final output için)
+        // Magnitude output (algoritma için)
         [Toggle] _OutputMagnitude ("Output Raw Magnitude", Float) = 0
-        _MagnitudeScale ("Magnitude Scale (raw output)", Range(0.5, 4.0)) = 1.0
-
-        // Crease filtresi: Bu değerin ÜSTÜNDE dot product → açı çok küçük → smooth yüzey → edge sayma
-        // Örnek: 0.94 ≈ cos(20°), 0.87 ≈ cos(30°), 0.71 ≈ cos(45°)
-        // Sphere/capsule mesh edge'leri (~10-20°) bastırmak için: 0.90-0.95
-        _MinCreaseDot ("Min Crease Dot (smooth=1, sharp=0)", Range(0, 1)) = 0.9
-        _HybridNormalBoost ("Hybrid Normal Boost", Range(0, 2)) = 1.25
-        _HybridCreaseStart ("Hybrid Crease Start", Range(0, 1)) = 0.05
-        _HybridCreaseEnd ("Hybrid Crease End", Range(0, 1)) = 0.20
+        _MagnitudeScale ("Magnitude Scale", Range(0.5, 4.0)) = 1.0
     }
-    
+
     SubShader
     {
         Tags { "RenderType"="Opaque" }
-        
+
         Pass
         {
             CGPROGRAM
-            
             #pragma vertex vert
             #pragma fragment frag
-            
+
             #pragma multi_compile _METHOD_SOBEL _METHOD_ROBERTS _METHOD_PREWITT
-            #pragma multi_compile _SOURCE_LUMINANCE _SOURCE_DEPTH _SOURCE_NORMAL _SOURCE_COMBINED _SOURCE_HYBRID
-            
+            #pragma multi_compile _SOURCE_LUMINANCE _SOURCE_DEPTH _SOURCE_NORMAL _SOURCE_COMBINED
+
             #include "UnityCG.cginc"
-            
+
             struct appdata
             {
                 float4 vertex : POSITION;
-                float2 uv : TEXCOORD0;
+                float2 uv     : TEXCOORD0;
             };
-            
+
             struct v2f
             {
-                float2 uv : TEXCOORD0;
+                float2 uv     : TEXCOORD0;
                 float4 vertex : SV_POSITION;
             };
-          
+
             sampler2D _MainTex;
-            float4 _MainTex_TexelSize;
-            
-            sampler2D _CameraDepthTexture;        
-            sampler2D _CameraDepthNormalsTexture; 
-            
-            float _EdgeThreshold;
+            float4    _MainTex_TexelSize;
+            sampler2D _CameraDepthTexture;
+            sampler2D _CameraDepthNormalsTexture;
+
+            float  _EdgeThreshold;
             float4 _EdgeColor;
             float4 _BackgroundColor;
-            float _DepthSensitivity;
-            float _MaxDepth;
-            float _NormalSensitivity;
-            float _DepthWeight;
-            float _NormalWeight;
-            float _ColorWeight;
-            float _InvertOutput;
-            float _OutputMagnitude;  // YENİ
-            float _MagnitudeScale;
-            float _MinCreaseDot;     // Crease filtresi: bu dot değerinden BÜYÜK açılar edge sayılmaz
-            float _HybridNormalBoost;
-            float _HybridCreaseStart;
-            float _HybridCreaseEnd;
-            
-            v2f vert (appdata v)
+            float  _DepthSensitivity;
+            float  _MaxDepth;
+            float  _NormalSensitivity;
+            float  _DepthWeight;
+            float  _NormalWeight;
+            float  _ColorWeight;
+            float  _MinCreaseDot;
+            float  _InvertOutput;
+            float  _OutputMagnitude;
+            float  _MagnitudeScale;
+
+            // ===================== VERTEX =====================
+            v2f vert(appdata v)
             {
                 v2f o;
                 o.vertex = UnityObjectToClipPos(v.vertex);
-                o.uv = v.uv;
+                o.uv     = v.uv;
                 return o;
             }
-            
-            /// RGB rengi parlaklık değerine çevirir
-            float Luminance(float3 color)
+
+            // ===================== HELPERS =====================
+            float Luma(float3 c)
             {
-                return dot(color, float3(0.299, 0.587, 0.114));
+                return dot(c, float3(0.299, 0.587, 0.114));
             }
-            
+
             float SampleDepth(float2 uv)
             {
-                float depth = SAMPLE_DEPTH_TEXTURE(_CameraDepthTexture, uv);
-                return LinearEyeDepth(depth);
+                float d = SAMPLE_DEPTH_TEXTURE(_CameraDepthTexture, uv);
+                return LinearEyeDepth(d);
             }
-            
+
             float3 SampleNormal(float2 uv)
             {
                 float4 dn = tex2D(_CameraDepthNormalsTexture, uv);
-                float3 normal;
-                float depth;
-                DecodeDepthNormal(dn, depth, normal);
-                return normal;
+                float3 n; float d;
+                DecodeDepthNormal(dn, d, n);
+                return n;
             }
-            
-            /// Seçilen kaynağa göre piksel değeri döndürür
+
+            // Kaynak değeri: seçilen moda göre skaler döndürür
             float GetSourceValue(float2 uv)
             {
                 #if _SOURCE_LUMINANCE
-                    return Luminance(tex2D(_MainTex, uv).rgb);
-                    
+                    return Luma(tex2D(_MainTex, uv).rgb);
                 #elif _SOURCE_DEPTH
                     return saturate(SampleDepth(uv) / _MaxDepth) * _DepthSensitivity;
-                    
                 #elif _SOURCE_NORMAL
                     return length(SampleNormal(uv)) * _NormalSensitivity;
-                    
                 #else
-                    return Luminance(tex2D(_MainTex, uv).rgb);
+                    return Luma(tex2D(_MainTex, uv).rgb);
                 #endif
             }
-            
-            // ========================================================
-            // EDGE DETECTION ALGORİTMALARI
-            // ========================================================
-            
-            /// SOBEL Operatörü (3x3)
+
+            // ===================== OPERATÖRLER =====================
+            // Sobel 3×3
             float2 Sobel(float2 uv, float2 t)
             {
-                float tl = GetSourceValue(uv + float2(-t.x, t.y));
-                float tm = GetSourceValue(uv + float2(0, t.y));
-                float tr = GetSourceValue(uv + float2(t.x, t.y));
-                float ml = GetSourceValue(uv + float2(-t.x, 0));
-                float mr = GetSourceValue(uv + float2(t.x, 0));
+                float tl = GetSourceValue(uv + float2(-t.x,  t.y));
+                float tm = GetSourceValue(uv + float2(   0,  t.y));
+                float tr = GetSourceValue(uv + float2( t.x,  t.y));
+                float ml = GetSourceValue(uv + float2(-t.x,    0));
+                float mr = GetSourceValue(uv + float2( t.x,    0));
                 float bl = GetSourceValue(uv + float2(-t.x, -t.y));
-                float bm = GetSourceValue(uv + float2(0, -t.y));
-                float br = GetSourceValue(uv + float2(t.x, -t.y));
-                
+                float bm = GetSourceValue(uv + float2(   0, -t.y));
+                float br = GetSourceValue(uv + float2( t.x, -t.y));
+
                 float gx = -tl - 2.0*ml - bl + tr + 2.0*mr + br;
                 float gy = -tl - 2.0*tm - tr + bl + 2.0*bm + br;
-                
                 return float2(gx, gy);
             }
-            
-            /// ROBERTS Cross Operatörü (2x2)
+
+            // Roberts Cross 2×2
             float2 Roberts(float2 uv, float2 t)
             {
                 float c  = GetSourceValue(uv);
-                float r  = GetSourceValue(uv + float2(t.x, 0));
-                float b  = GetSourceValue(uv + float2(0, -t.y));
+                float r  = GetSourceValue(uv + float2(t.x,    0));
+                float b  = GetSourceValue(uv + float2(   0, -t.y));
                 float br = GetSourceValue(uv + float2(t.x, -t.y));
-                
                 return float2(c - br, r - b);
             }
-            
-            /// PREWITT Operatörü (3x3)
+
+            // Prewitt 3×3
             float2 Prewitt(float2 uv, float2 t)
             {
-                float tl = GetSourceValue(uv + float2(-t.x, t.y));
-                float tm = GetSourceValue(uv + float2(0, t.y));
-                float tr = GetSourceValue(uv + float2(t.x, t.y));
-                float ml = GetSourceValue(uv + float2(-t.x, 0));
-                float mr = GetSourceValue(uv + float2(t.x, 0));
+                float tl = GetSourceValue(uv + float2(-t.x,  t.y));
+                float tm = GetSourceValue(uv + float2(   0,  t.y));
+                float tr = GetSourceValue(uv + float2( t.x,  t.y));
+                float ml = GetSourceValue(uv + float2(-t.x,    0));
+                float mr = GetSourceValue(uv + float2( t.x,    0));
                 float bl = GetSourceValue(uv + float2(-t.x, -t.y));
-                float bm = GetSourceValue(uv + float2(0, -t.y));
-                float br = GetSourceValue(uv + float2(t.x, -t.y));
-                
+                float bm = GetSourceValue(uv + float2(   0, -t.y));
+                float br = GetSourceValue(uv + float2( t.x, -t.y));
+
                 float gx = -tl - ml - bl + tr + mr + br;
                 float gy = -tl - tm - tr + bl + bm + br;
-                
                 return float2(gx, gy);
             }
 
-            void GetEdgeComponents(float2 uv, float2 t, out float depthEdge, out float normalEdge, out float colorEdge, out float localSharpness)
+            // ===================== COMBINED EDGE =====================
+            // Depth + Normal + Color birleşik kenar hesabı
+            float GetCombinedEdge(float2 uv, float2 t)
             {
-                depthEdge = 0;
-                normalEdge = 0;
-                colorEdge = 0;
-                localSharpness = 0;
-                
-                // RENK KENARLARI (Sobel on Luminance)
+                float edge = 0;
+
+                // Renk kenarları (Sobel on luminance)
                 if (_ColorWeight > 0.01)
                 {
-                    float tl = Luminance(tex2D(_MainTex, uv + float2(-t.x, t.y)).rgb);
-                    float tm = Luminance(tex2D(_MainTex, uv + float2(0, t.y)).rgb);
-                    float tr = Luminance(tex2D(_MainTex, uv + float2(t.x, t.y)).rgb);
-                    float ml = Luminance(tex2D(_MainTex, uv + float2(-t.x, 0)).rgb);
-                    float mr = Luminance(tex2D(_MainTex, uv + float2(t.x, 0)).rgb);
-                    float bl = Luminance(tex2D(_MainTex, uv + float2(-t.x, -t.y)).rgb);
-                    float bm = Luminance(tex2D(_MainTex, uv + float2(0, -t.y)).rgb);
-                    float br = Luminance(tex2D(_MainTex, uv + float2(t.x, -t.y)).rgb);
-                    
+                    float tl = Luma(tex2D(_MainTex, uv + float2(-t.x,  t.y)).rgb);
+                    float tm = Luma(tex2D(_MainTex, uv + float2(   0,  t.y)).rgb);
+                    float tr = Luma(tex2D(_MainTex, uv + float2( t.x,  t.y)).rgb);
+                    float ml = Luma(tex2D(_MainTex, uv + float2(-t.x,    0)).rgb);
+                    float mr = Luma(tex2D(_MainTex, uv + float2( t.x,    0)).rgb);
+                    float bl = Luma(tex2D(_MainTex, uv + float2(-t.x, -t.y)).rgb);
+                    float bm = Luma(tex2D(_MainTex, uv + float2(   0, -t.y)).rgb);
+                    float br = Luma(tex2D(_MainTex, uv + float2( t.x, -t.y)).rgb);
+
                     float gx = -tl - 2.0*ml - bl + tr + 2.0*mr + br;
                     float gy = -tl - 2.0*tm - tr + bl + 2.0*bm + br;
-                    
-                    colorEdge = sqrt(gx*gx + gy*gy) * _ColorWeight;
+                    edge += sqrt(gx*gx + gy*gy) * _ColorWeight;
                 }
-                
-                // DERİNLİK KENARLARI
+
+                // Derinlik kenarları
                 if (_DepthWeight > 0.01)
                 {
                     float dc = SampleDepth(uv);
-                    float dt = SampleDepth(uv + float2(0, t.y));
+                    float dt = SampleDepth(uv + float2(0,  t.y));
                     float db = SampleDepth(uv + float2(0, -t.y));
                     float dl = SampleDepth(uv + float2(-t.x, 0));
-                    float dr = SampleDepth(uv + float2(t.x, 0));
-                    
-                    float de = abs(dc-dt) + abs(dc-db) + abs(dc-dl) + abs(dc-dr);
-                    depthEdge = de * _DepthSensitivity * _DepthWeight;
+                    float dr = SampleDepth(uv + float2( t.x, 0));
+                    edge += (abs(dc-dt) + abs(dc-db) + abs(dc-dl) + abs(dc-dr))
+                            * _DepthSensitivity * _DepthWeight;
                 }
-                
-                // NORMAL KENARLARI
+
+                // Normal kenarları (crease filtreli)
                 if (_NormalWeight > 0.01)
                 {
                     float3 nc = SampleNormal(uv);
-                    float3 nt = SampleNormal(uv + float2(0, t.y));
+                    float3 nt = SampleNormal(uv + float2(0,  t.y));
                     float3 nb = SampleNormal(uv + float2(0, -t.y));
                     float3 nl = SampleNormal(uv + float2(-t.x, 0));
-                    float3 nr = SampleNormal(uv + float2(t.x, 0));
+                    float3 nr = SampleNormal(uv + float2( t.x, 0));
 
-                    // Her komşu için dot product (1 = aynı yön, 0 = dik, -1 = zıt)
                     float dotT = saturate(dot(nc, nt));
                     float dotB = saturate(dot(nc, nb));
                     float dotL = saturate(dot(nc, nl));
                     float dotR = saturate(dot(nc, nr));
-                    float sharpT = 1.0 - dotT;
-                    float sharpB = 1.0 - dotB;
-                    float sharpL = 1.0 - dotL;
-                    float sharpR = 1.0 - dotR;
-                    localSharpness = max(max(sharpT, sharpB), max(sharpL, sharpR));
 
                     float ne = 0;
-                    // CREASE FİLTRESİ: Yalnızca açı _MinCreaseDot eşiğini GEÇEN kenarlara bak.
-                    // dot > _MinCreaseDot → açı çok küçük → smooth yüzey (sphere/capsule mesh edge) → atla.
-                    // dot < _MinCreaseDot → açı büyük → gerçek crease (kutu köşesi vb.) → ekle.
+                    // Crease filtresi: dot < _MinCreaseDot → açı büyük → gerçek kenar
                     if (dotT < _MinCreaseDot) ne += pow(1.0 - dotT, 2);
                     if (dotB < _MinCreaseDot) ne += pow(1.0 - dotB, 2);
                     if (dotL < _MinCreaseDot) ne += pow(1.0 - dotL, 2);
                     if (dotR < _MinCreaseDot) ne += pow(1.0 - dotR, 2);
 
-                    normalEdge = ne * _NormalSensitivity * _NormalWeight;
+                    edge += ne * _NormalSensitivity * _NormalWeight;
                 }
+
+                return edge;
             }
 
-            float GetCombinedEdge(float2 uv, float2 t)
-            {
-                float depthEdge, normalEdge, colorEdge, localSharpness;
-                GetEdgeComponents(uv, t, depthEdge, normalEdge, colorEdge, localSharpness);
-                return depthEdge + normalEdge + colorEdge;
-            }
-
-            float GetHybridEdge(float2 uv, float2 t)
-            {
-                float depthEdge, normalEdge, colorEdge, localSharpness;
-                GetEdgeComponents(uv, t, depthEdge, normalEdge, colorEdge, localSharpness);
-
-                float denom = max(1e-4, _HybridCreaseEnd - _HybridCreaseStart);
-                float creaseMask = saturate((localSharpness - _HybridCreaseStart) / denom);
-                creaseMask = smoothstep(0.0, 1.0, creaseMask);
-
-                // Smooth/curved bölgede depth öncelikli; keskin bölgede combined katkısı artar.
-                float hybridNormal = normalEdge * lerp(0.0, _HybridNormalBoost, creaseMask);
-                float hybridColor  = colorEdge * creaseMask;
-                return depthEdge + hybridNormal + hybridColor;
-            }
-            
-            fixed4 frag (v2f i) : SV_Target
+            // ===================== FRAGMENT =====================
+            fixed4 frag(v2f i) : SV_Target
             {
                 float2 t = _MainTex_TexelSize.xy;
-                
                 float mag = 0;
-                
+
                 #if _SOURCE_COMBINED
                     mag = GetCombinedEdge(i.uv, t);
-                #elif _SOURCE_HYBRID
-                    mag = GetHybridEdge(i.uv, t);
                 #else
+                    float2 g = float2(0, 0);
+
                     #if _METHOD_SOBEL
-                        float2 g = Sobel(i.uv, t);
-                        mag = sqrt(g.x*g.x + g.y*g.y);
-                        
+                        g = Sobel(i.uv, t);
                     #elif _METHOD_ROBERTS
-                        float2 g = Roberts(i.uv, t);
-                        mag = sqrt(g.x*g.x + g.y*g.y);
-                        
+                        g = Roberts(i.uv, t);
                     #elif _METHOD_PREWITT
-                        float2 g = Prewitt(i.uv, t);
-                        mag = sqrt(g.x*g.x + g.y*g.y);
+                        g = Prewitt(i.uv, t);
                     #endif
+
+                    mag = sqrt(g.x*g.x + g.y*g.y);
                 #endif
-                
-                // ========================================
-                // YENİ: Magnitude output modu
-                // Thinning için continuous değer lazım
-                // ========================================
+
+                // Raw magnitude output (algoritma/compute shader için)
                 if (_OutputMagnitude > 0.5)
                 {
-                    // Thinning pass için: raw magnitude değerini çıkar
-                    // Normalize et ki 0-1 aralığında kalsın
-                    float normalizedMag = saturate(mag * _MagnitudeScale);
-                    return fixed4(normalizedMag, normalizedMag, normalizedMag, 1);
+                    float m = saturate(mag * _MagnitudeScale);
+                    return fixed4(m, m, m, 1);
                 }
-                
-                // Normal mod: binary threshold
+
+                // Binary threshold (ekran için)
                 float edge = step(_EdgeThreshold, mag);
-                
                 if (_InvertOutput > 0.5)
                     edge = 1.0 - edge;
-                
+
                 return lerp(_BackgroundColor, _EdgeColor, edge);
             }
             ENDCG
         }
+
     }
-    
+
     FallBack "Diffuse"
 }
